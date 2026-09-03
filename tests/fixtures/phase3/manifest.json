@@ -1,0 +1,11 @@
+{
+  "name": "OASIS Phase 3 synthetic evidence fixture",
+  "license": "CC0-1.0",
+  "source": "Fully synthetic; created for offline tests",
+  "version": "1.0.0",
+  "files": [
+    "population.geojson",
+    "candidates.geojson",
+    "transport_graph.json"
+  ]
+}

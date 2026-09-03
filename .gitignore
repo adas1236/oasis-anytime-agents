@@ -1,0 +1,68 @@
+# Project policy: ignore local planning notes while keeping the root README tracked.
+*.md
+!/README.md
+
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# uv and package build output
+.uv-cache/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test, type-check, lint, and coverage output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets, logs, and local state
+*.log
+logs/
+secrets/
+*.pem
+*.key
+
+# Downloaded models and caches
+models/
+model-cache/
+hf-cache/
+.cache/huggingface/
+
+# Generated evidence, artifacts, run state, and evaluation output
+.oasis/
+data/generated/
+data/cache/
+artifacts/
+runs/
+run-output/
+evaluation-output/
+evaluations/output/
+
+# Optional frontend build locations
+node_modules/
+ui/dist/
+ui/build/

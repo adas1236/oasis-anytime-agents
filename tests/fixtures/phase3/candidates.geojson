@@ -1,0 +1,17 @@
+{
+  "type": "FeatureCollection",
+  "name": "synthetic_candidate_facilities",
+  "crs": {"type": "name", "properties": {"name": "EPSG:4326"}},
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"site_id": "s1", "opening_cost": 1.0, "capacity": 200},
+      "geometry": {"type": "Point", "coordinates": [-74.000, 40.700]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"site_id": "s2", "opening_cost": 1.5, "capacity": 250},
+      "geometry": {"type": "Point", "coordinates": [-73.980, 40.700]}
+    }
+  ]
+}

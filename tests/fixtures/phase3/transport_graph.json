@@ -1,0 +1,14 @@
+{
+  "directed": true,
+  "crs": "EPSG:4326",
+  "units": "minutes",
+  "nodes": [
+    {"id": "n1", "x": -74.000, "y": 40.700},
+    {"id": "n2", "x": -73.990, "y": 40.700},
+    {"id": "n3", "x": -73.980, "y": 40.700}
+  ],
+  "edges": [
+    {"source": "n1", "target": "n2", "minutes": 5.0},
+    {"source": "n2", "target": "n3", "minutes": 7.0}
+  ]
+}
