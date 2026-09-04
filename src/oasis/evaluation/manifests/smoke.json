@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.0",
+  "benchmark_id": "offline-smoke-v1",
+  "track": "formal_optimization",
+  "instances": [
+    {"id": "cooling", "fixture": "cooling_centers"},
+    {"id": "mobile", "fixture": "mobile_routing"}
+  ],
+  "comparisons": [
+    "deterministic_portfolio",
+    "one_shot_model",
+    "iterative_model"
+  ],
+  "budgets": [
+    {
+      "id": "smoke",
+      "resources": {
+        "wall_time_ms": 30000,
+        "max_total_model_tokens": 4096,
+        "max_generated_tokens": 1024,
+        "max_tool_calls": 8
+      }
+    }
+  ],
+  "run_seeds": [17, 29],
+  "model": {"backend": "fake", "profile": "gemma4_e4b_it"},
+  "runtime_policy": {"device": "cpu", "engine": "auto"},
+  "tool_suite": [
+    "add_swap",
+    "multi_swap",
+    "scenario_aware",
+    "relocate",
+    "two_opt",
+    "swap",
+    "exact_enumeration"
+  ],
+  "expected_evaluator_versions": {"*": "1.0.0"},
+  "max_exact_candidates": 50000,
+  "max_reference_candidates": 2000,
+  "max_candidates_per_action": 5000
+}

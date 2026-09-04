@@ -8,11 +8,14 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from oasis.artifacts import put_json
-from oasis.problems.location_allocation import create_problem_registry, load_problem_data
+from oasis.problems.location_allocation import load_problem_data
 from oasis.problems.protocols import Deadline
-from oasis.problems.registry import ProblemRegistry
+from oasis.problems.registry import ProblemRegistry, create_builtin_problem_registry
+from oasis.problems.routing import load_route_data
+from oasis.problems.routing_search import route_candidate_space, solve_route_ortools
 from oasis.problems.schemas import (
     Comparison,
+    LocationAllocationProblem,
     SearchResumeToken,
     SearchStrategy,
     VerifiedBound,
@@ -71,18 +74,20 @@ class ImproveOutput(BaseModel):
 class ImproveTool:
     """Search one bounded slice while streaming only independently verified improvements."""
 
-    version = "1.0.0"
+    version = "1.1.0"
     spec = ToolSpec(
         name="improve",
         version=version,
         description=(
-            "Run a registered location-allocation improvement strategy, streaming every "
+            "Run a registered location or routing improvement strategy, streaming every "
             "independently rescored feasible improvement and any verified search bound."
         ),
         input_schema=ImproveInput.model_json_schema(),
         output_schema=ImproveOutput.model_json_schema(),
-        capability_tags=frozenset({"decision", "search", "location_allocation", "offline"}),
-        problem_tags=frozenset({"location_allocation"}),
+        capability_tags=frozenset(
+            {"decision", "search", "location_allocation", "routing", "offline"}
+        ),
+        problem_tags=frozenset({"location_allocation", "routing"}),
         artifact_tags=frozenset(
             {
                 ArtifactKind.JSON_SPECIFICATION,
@@ -96,7 +101,7 @@ class ImproveTool:
         seed_description=(
             "all strategy and tie-breaking order is deterministic; seed is recorded only"
         ),
-        runtime=ToolRuntimeEstimate(p50_ms=20, p95_ms=10_000, time_to_first_candidate_ms=20),
+        runtime=ToolRuntimeEstimate(p50_ms=125, p95_ms=10_000, time_to_first_candidate_ms=20),
         streams_progress=True,
         streams_candidates=True,
         streams_bounds=True,
@@ -111,7 +116,7 @@ class ImproveTool:
     )
 
     def __init__(self, registry: ProblemRegistry | None = None) -> None:
-        self._registry = registry or create_problem_registry()
+        self._registry = registry or create_builtin_problem_registry()
 
     async def run(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         """Non-streaming convenience path returning the terminal envelope."""
@@ -159,10 +164,20 @@ class ImproveTool:
         complete = True
         bound: VerifiedBound | None = None
 
-        if request.strategy is SearchStrategy.ORTOOLS_CP_SAT:
+        if request.strategy in {SearchStrategy.ORTOOLS_CP_SAT, SearchStrategy.ORTOOLS_ROUTING}:
             context.cancellation.raise_if_cancelled()
-            data = load_problem_data(problem, context.artifact_store)
-            solved = solve_ortools(problem, data, max_time_seconds=context.remaining_seconds)
+            if isinstance(problem, LocationAllocationProblem):
+                if request.strategy is not SearchStrategy.ORTOOLS_CP_SAT:
+                    invalid("location problems require the ortools_cp_sat solver strategy")
+                data = load_problem_data(problem, context.artifact_store)
+                solved = solve_ortools(problem, data, max_time_seconds=context.remaining_seconds)
+            else:
+                if request.strategy is not SearchStrategy.ORTOOLS_ROUTING:
+                    invalid("route problems require the ortools_routing solver strategy")
+                route_data = load_route_data(problem, context.artifact_store)
+                solved = solve_route_ortools(
+                    problem, route_data, max_time_seconds=context.remaining_seconds
+                )
             score = plugin.measure(problem, solved.plan, context.artifact_store)
             if not score.feasible:
                 raise ValueError("OR-Tools candidate failed independent evaluation")
@@ -182,8 +197,12 @@ class ImproveTool:
             )
             complete = bound.complete
         else:
-            data = load_problem_data(problem, context.artifact_store)
-            space = candidate_space(problem, data, incumbent, request.strategy)
+            if isinstance(problem, LocationAllocationProblem):
+                data = load_problem_data(problem, context.artifact_store)
+                space = candidate_space(problem, data, incumbent, request.strategy)
+            else:
+                route_data = load_route_data(problem, context.artifact_store)
+                space = route_candidate_space(problem, route_data, incumbent, request.strategy)
             exhausted = True
             resume_cursor = next_index
             for cursor, candidate in enumerate(space.plans):
@@ -236,7 +255,11 @@ class ImproveTool:
                     best_comparator_key=incumbent_score.comparator_key,
                     certificate={
                         "method": "complete_enumeration",
-                        "candidate_order": "site-count then lexicographic candidate index",
+                        "candidate_order": (
+                            "site-count then lexicographic candidate index"
+                            if isinstance(problem, LocationAllocationProblem)
+                            else "visit-count, node combination, then route permutation"
+                        ),
                     },
                 )
 

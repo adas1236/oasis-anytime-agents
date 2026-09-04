@@ -1,25 +1,31 @@
-"""Compile immutable evidence and policy into an admitted location problem."""
+"""Compile immutable evidence and policy into an admitted decision problem."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from oasis.artifacts import put_json, read_json
-from oasis.problems.location_allocation import create_problem_registry, problem_hashes
+from oasis.problems.location_allocation import problem_hashes
 from oasis.problems.protocols import Deadline
-from oasis.problems.registry import ProblemRegistry
+from oasis.problems.registry import ProblemRegistry, create_builtin_problem_registry
+from oasis.problems.routing import route_problem_hashes
 from oasis.problems.schemas import (
     EquityGroup,
     LocationAllocationPolicy,
     LocationAllocationProblem,
     LocationProblemType,
+    RouteProblemType,
+    RouteScenario,
+    RouteServicePolicy,
+    RouteServiceProblem,
     ServiceScenario,
 )
 from oasis.schemas import (
     ArtifactKind,
+    ArtifactRef,
     CandidateSpec,
     DemandSpec,
     DeterminismClassification,
@@ -35,17 +41,65 @@ from oasis.tools.protocols import ToolContext
 
 
 class CompileProblemInput(BaseModel):
+    """Typed union of location and route compilation inputs selected by ``type_id``."""
+
     model_config = ConfigDict(frozen=True)
 
-    type_id: LocationProblemType
-    demand_spec_artifact_id: str = Field(pattern=r"^sha256-[0-9a-f]{64}$")
-    candidate_spec_artifact_id: str = Field(pattern=r"^sha256-[0-9a-f]{64}$")
-    access_matrix_artifact_id: str = Field(pattern=r"^sha256-[0-9a-f]{64}$")
-    service_matrix_artifact_ids: dict[str, str] = Field(min_length=1)
+    type_id: LocationProblemType | RouteProblemType
+
+    demand_spec_artifact_id: str | None = Field(default=None, pattern=r"^sha256-[0-9a-f]{64}$")
+    candidate_spec_artifact_id: str | None = Field(default=None, pattern=r"^sha256-[0-9a-f]{64}$")
+    access_matrix_artifact_id: str | None = Field(default=None, pattern=r"^sha256-[0-9a-f]{64}$")
+    service_matrix_artifact_ids: dict[str, str] = Field(default_factory=dict)
+    access_scenario_artifact_ids: dict[str, str] = Field(default_factory=dict)
+    demand_multiplier_artifact_ids: dict[str, str] = Field(default_factory=dict)
+    failed_site_ids_by_scenario: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     service_scenario_weights: dict[str, float] = Field(default_factory=dict)
-    need_field: str = Field(min_length=1)
+    need_field: str | None = None
     groups: tuple[EquityGroup, ...] = ()
-    policy: LocationAllocationPolicy
+
+    nodes_artifact_id: str | None = Field(default=None, pattern=r"^sha256-[0-9a-f]{64}$")
+    node_id_field: str | None = None
+    prize_field: str | None = None
+    demand_field: str | None = None
+    service_time_field: str | None = None
+    window_start_field: str | None = None
+    window_end_field: str | None = None
+    travel_matrix_artifact_ids: dict[str, str] = Field(default_factory=dict)
+    travel_demand_multiplier_artifact_ids: dict[str, str] = Field(default_factory=dict)
+    travel_scenario_weights: dict[str, float] = Field(default_factory=dict)
+
+    policy: LocationAllocationPolicy | RouteServicePolicy
+
+    @model_validator(mode="after")
+    def family_fields_are_complete(self) -> Self:
+        if isinstance(self.type_id, LocationProblemType):
+            if not isinstance(self.policy, LocationAllocationPolicy):
+                raise ValueError("location problem types require a location-allocation policy")
+            required = {
+                "demand_spec_artifact_id": self.demand_spec_artifact_id,
+                "candidate_spec_artifact_id": self.candidate_spec_artifact_id,
+                "access_matrix_artifact_id": self.access_matrix_artifact_id,
+                "need_field": self.need_field,
+            }
+            missing = sorted(name for name, value in required.items() if value is None)
+            if not self.service_matrix_artifact_ids:
+                missing.append("service_matrix_artifact_ids")
+            if missing:
+                raise ValueError("location compilation is missing: " + ", ".join(missing))
+        else:
+            if not isinstance(self.policy, RouteServicePolicy):
+                raise ValueError("route problem types require a route-service policy")
+            required = {
+                "nodes_artifact_id": self.nodes_artifact_id,
+                "node_id_field": self.node_id_field,
+            }
+            missing = sorted(name for name, value in required.items() if value is None)
+            if not self.travel_matrix_artifact_ids:
+                missing.append("travel_matrix_artifact_ids")
+            if missing:
+                raise ValueError("route compilation is missing: " + ", ".join(missing))
+        return self
 
 
 class CompileProblemOutput(BaseModel):
@@ -59,21 +113,187 @@ class CompileProblemOutput(BaseModel):
     issue_codes: tuple[str, ...] = ()
 
 
-class CompileProblemTool:
-    """Validate dimensions/units/policy and commit a problem plus feasible baseline."""
+def _scenario_keys_are_valid(request: CompileProblemInput, names: set[str]) -> None:
+    mappings = (
+        ("access_scenario_artifact_ids", set(request.access_scenario_artifact_ids)),
+        ("demand_multiplier_artifact_ids", set(request.demand_multiplier_artifact_ids)),
+        ("failed_site_ids_by_scenario", set(request.failed_site_ids_by_scenario)),
+    )
+    for label, values in mappings:
+        if not set(values) <= names:
+            invalid(f"{label} may name only declared service scenarios")
+    if request.service_scenario_weights and set(request.service_scenario_weights) != names:
+        invalid("service_scenario_weights must name every service matrix exactly")
 
-    version = "1.0.0"
+
+def _compile_location(
+    request: CompileProblemInput, context: ToolContext
+) -> tuple[LocationAllocationProblem, tuple[ArtifactRef, ...]]:
+    assert request.demand_spec_artifact_id is not None
+    assert request.candidate_spec_artifact_id is not None
+    assert request.access_matrix_artifact_id is not None
+    assert request.need_field is not None
+    assert isinstance(request.type_id, LocationProblemType)
+    assert isinstance(request.policy, LocationAllocationPolicy)
+    demand_spec_ref = artifact_ref(context, request.demand_spec_artifact_id)
+    candidate_spec_ref = artifact_ref(context, request.candidate_spec_artifact_id)
+    access_ref = artifact_ref(context, request.access_matrix_artifact_id)
+    require_kind(demand_spec_ref, {ArtifactKind.JSON_SPECIFICATION})
+    require_kind(candidate_spec_ref, {ArtifactKind.JSON_SPECIFICATION})
+    require_kind(access_ref, {ArtifactKind.MATRIX})
+    try:
+        demand = DemandSpec.model_validate(read_json(context.artifact_store, demand_spec_ref))
+        candidates = CandidateSpec.model_validate(
+            read_json(context.artifact_store, candidate_spec_ref)
+        )
+    except ValueError as error:
+        invalid(f"invalid evidence specification: {error}")
+    names = set(request.service_matrix_artifact_ids)
+    _scenario_keys_are_valid(request, names)
+    if (
+        request.service_scenario_weights
+        and request.policy.scenario_weights
+        and request.service_scenario_weights != request.policy.scenario_weights
+    ):
+        invalid("scenario weights declared in two places must agree exactly")
+    parents: list[ArtifactRef] = [demand_spec_ref, candidate_spec_ref, access_ref]
+    scenarios: list[ServiceScenario] = []
+    for name, service_id in sorted(request.service_matrix_artifact_ids.items()):
+        service_ref = artifact_ref(context, service_id)
+        require_kind(service_ref, {ArtifactKind.MATRIX})
+        parents.append(service_ref)
+        scenario_access = None
+        if name in request.access_scenario_artifact_ids:
+            scenario_access = artifact_ref(context, request.access_scenario_artifact_ids[name])
+            require_kind(scenario_access, {ArtifactKind.MATRIX})
+            parents.append(scenario_access)
+        multiplier = None
+        if name in request.demand_multiplier_artifact_ids:
+            multiplier = artifact_ref(context, request.demand_multiplier_artifact_ids[name])
+            require_kind(multiplier, {ArtifactKind.MATRIX})
+            parents.append(multiplier)
+        scenarios.append(
+            ServiceScenario(
+                name=name,
+                service_matrix=service_ref,
+                access_matrix=scenario_access,
+                demand_multiplier=multiplier,
+                failed_site_ids=request.failed_site_ids_by_scenario.get(name, ()),
+                weight=request.service_scenario_weights.get(name, 1.0),
+            )
+        )
+    blank = "0" * 64
+    problem = LocationAllocationProblem(
+        type_id=request.type_id,
+        demand=demand,
+        candidates=candidates,
+        access_matrix=access_ref,
+        service_scenarios=tuple(scenarios),
+        need_field=request.need_field,
+        groups=request.groups,
+        policy=request.policy,
+        evidence_hash=blank,
+        policy_hash=blank,
+        problem_hash=blank,
+    )
+    evidence_hash, policy_hash, complete_hash = problem_hashes(problem)
+    return (
+        problem.model_copy(
+            update={
+                "evidence_hash": evidence_hash,
+                "policy_hash": policy_hash,
+                "problem_hash": complete_hash,
+            }
+        ),
+        tuple(parents),
+    )
+
+
+def _compile_route(
+    request: CompileProblemInput, context: ToolContext
+) -> tuple[RouteServiceProblem, tuple[ArtifactRef, ...]]:
+    assert request.nodes_artifact_id is not None
+    assert request.node_id_field is not None
+    assert isinstance(request.type_id, RouteProblemType)
+    assert isinstance(request.policy, RouteServicePolicy)
+    nodes_ref = artifact_ref(context, request.nodes_artifact_id)
+    require_kind(nodes_ref, {ArtifactKind.VECTOR, ArtifactKind.TABLE})
+    names = set(request.travel_matrix_artifact_ids)
+    if request.travel_scenario_weights and set(request.travel_scenario_weights) != names:
+        invalid("travel_scenario_weights must name every travel matrix exactly")
+    if not set(request.travel_demand_multiplier_artifact_ids) <= names:
+        invalid("travel demand multipliers may name only declared travel scenarios")
+    if (
+        request.travel_scenario_weights
+        and request.policy.scenario_weights
+        and request.travel_scenario_weights != request.policy.scenario_weights
+    ):
+        invalid("scenario weights declared in two places must agree exactly")
+    parents: list[ArtifactRef] = [nodes_ref]
+    scenarios: list[RouteScenario] = []
+    for name, travel_id in sorted(request.travel_matrix_artifact_ids.items()):
+        travel_ref = artifact_ref(context, travel_id)
+        require_kind(travel_ref, {ArtifactKind.MATRIX})
+        parents.append(travel_ref)
+        multiplier = None
+        if name in request.travel_demand_multiplier_artifact_ids:
+            multiplier = artifact_ref(context, request.travel_demand_multiplier_artifact_ids[name])
+            require_kind(multiplier, {ArtifactKind.MATRIX})
+            parents.append(multiplier)
+        scenarios.append(
+            RouteScenario(
+                name=name,
+                travel_matrix=travel_ref,
+                demand_multiplier=multiplier,
+                weight=request.travel_scenario_weights.get(name, 1.0),
+            )
+        )
+    blank = "0" * 64
+    problem = RouteServiceProblem(
+        type_id=request.type_id,
+        nodes=nodes_ref,
+        node_id_field=request.node_id_field,
+        prize_field=request.prize_field,
+        demand_field=request.demand_field,
+        service_time_field=request.service_time_field,
+        window_start_field=request.window_start_field,
+        window_end_field=request.window_end_field,
+        travel_scenarios=tuple(scenarios),
+        policy=request.policy,
+        evidence_hash=blank,
+        policy_hash=blank,
+        problem_hash=blank,
+    )
+    evidence_hash, policy_hash, complete_hash = route_problem_hashes(problem)
+    return (
+        problem.model_copy(
+            update={
+                "evidence_hash": evidence_hash,
+                "policy_hash": policy_hash,
+                "problem_hash": complete_hash,
+            }
+        ),
+        tuple(parents),
+    )
+
+
+class CompileProblemTool:
+    """Validate evidence/policy and commit a problem plus independently scored baseline."""
+
+    version = "1.1.0"
     spec = ToolSpec(
         name="compile_problem",
         version=version,
         description=(
-            "Compile immutable demand, candidate, access, service, and policy evidence into a "
-            "validated location-allocation problem and independently scored feasible baseline."
+            "Compile immutable location-allocation or route-service evidence and policy into a "
+            "validated problem with an independently scored feasible baseline."
         ),
         input_schema=CompileProblemInput.model_json_schema(),
         output_schema=CompileProblemOutput.model_json_schema(),
-        capability_tags=frozenset({"decision", "compile", "location_allocation", "offline"}),
-        problem_tags=frozenset({"location_allocation"}),
+        capability_tags=frozenset(
+            {"decision", "compile", "location_allocation", "routing", "offline"}
+        ),
+        problem_tags=frozenset({"location_allocation", "routing"}),
         artifact_tags=frozenset(
             {ArtifactKind.JSON_SPECIFICATION, ArtifactKind.MATRIX, ArtifactKind.PLAN}
         ),
@@ -92,68 +312,15 @@ class CompileProblemTool:
     )
 
     def __init__(self, registry: ProblemRegistry | None = None) -> None:
-        self._registry = registry or create_problem_registry()
+        self._registry = registry or create_builtin_problem_registry()
 
     async def run(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         request = CompileProblemInput.model_validate(arguments)
         context.cancellation.raise_if_cancelled()
-        demand_spec_ref = artifact_ref(context, request.demand_spec_artifact_id)
-        candidate_spec_ref = artifact_ref(context, request.candidate_spec_artifact_id)
-        access_ref = artifact_ref(context, request.access_matrix_artifact_id)
-        require_kind(demand_spec_ref, {ArtifactKind.JSON_SPECIFICATION})
-        require_kind(candidate_spec_ref, {ArtifactKind.JSON_SPECIFICATION})
-        require_kind(access_ref, {ArtifactKind.MATRIX})
-        try:
-            demand = DemandSpec.model_validate(read_json(context.artifact_store, demand_spec_ref))
-            candidates = CandidateSpec.model_validate(
-                read_json(context.artifact_store, candidate_spec_ref)
-            )
-        except ValueError as error:
-            invalid(f"invalid evidence specification: {error}")
-        scenarios: list[ServiceScenario] = []
-        service_refs = []
-        if request.service_scenario_weights and set(request.service_scenario_weights) != set(
-            request.service_matrix_artifact_ids
-        ):
-            invalid("service_scenario_weights must name every service matrix exactly")
-        if (
-            request.service_scenario_weights
-            and request.policy.scenario_weights
-            and request.service_scenario_weights != request.policy.scenario_weights
-        ):
-            invalid("scenario weights declared in two places must agree exactly")
-        for name, artifact_id in sorted(request.service_matrix_artifact_ids.items()):
-            reference = artifact_ref(context, artifact_id)
-            require_kind(reference, {ArtifactKind.MATRIX})
-            service_refs.append(reference)
-            scenarios.append(
-                ServiceScenario(
-                    name=name,
-                    service_matrix=reference,
-                    weight=request.service_scenario_weights.get(name, 1.0),
-                )
-            )
-        placeholder = "0" * 64
-        problem = LocationAllocationProblem(
-            type_id=request.type_id,
-            demand=demand,
-            candidates=candidates,
-            access_matrix=access_ref,
-            service_scenarios=tuple(scenarios),
-            need_field=request.need_field,
-            groups=request.groups,
-            policy=request.policy,
-            evidence_hash=placeholder,
-            policy_hash=placeholder,
-            problem_hash=placeholder,
-        )
-        evidence_hash, policy_hash, complete_hash = problem_hashes(problem)
-        problem = problem.model_copy(
-            update={
-                "evidence_hash": evidence_hash,
-                "policy_hash": policy_hash,
-                "problem_hash": complete_hash,
-            }
+        problem, parents = (
+            _compile_location(request, context)
+            if isinstance(request.type_id, LocationProblemType)
+            else _compile_route(request, context)
         )
         plugin = self._registry.get(problem.type_id.value)
         report = plugin.validate_spec(problem, context.artifact_store)
@@ -169,7 +336,6 @@ class CompileProblemTool:
                 },
                 metrics=output.model_dump(mode="json"),
             )
-        parents = (demand_spec_ref, candidate_spec_ref, access_ref, *service_refs)
         problem_ref = put_json(
             context.artifact_store,
             problem.model_dump(mode="json"),
@@ -181,10 +347,7 @@ class CompileProblemTool:
                 parents,
                 {"type_id": problem.type_id.value, "problem_hash": problem.problem_hash},
             ),
-            data_schema={
-                "type": "LocationAllocationProblem",
-                "version": problem.schema_version,
-            },
+            data_schema={"type": type(problem).__name__, "version": problem.schema_version},
         )
         try:
             baseline = plugin.make_baseline(

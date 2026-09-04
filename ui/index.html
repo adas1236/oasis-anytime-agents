@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#102a2a">
+    <meta name="oasis-api-base" content="/api/v1">
+    <title>OASIS · Anytime public-health planning</title>
+    <link rel="stylesheet" href="/styles/app.css">
+    <script type="module" src="/src/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to planning workspace</a>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">OASIS ANYTIME GEOAI</p>
+        <h1>Plans that stay valid while they improve.</h1>
+        <p class="lede">
+          Explore public-health interventions under explicit time, compute, and equity limits.
+          Every displayed incumbent is independently checked.
+        </p>
+      </div>
+      <div class="service-state" aria-live="polite">
+        <span class="status-mark" aria-hidden="true"></span>
+        <span id="service-status">Connecting to the planning service…</span>
+      </div>
+    </header>
+
+    <main id="workspace" class="workspace">
+      <section class="panel setup-panel" aria-labelledby="setup-title">
+        <div class="section-heading">
+          <p class="eyebrow">01 · FRAME THE RUN</p>
+          <h2 id="setup-title">Configure a public-health question</h2>
+        </div>
+
+        <form id="run-form">
+          <fieldset>
+            <legend>Problem and policy</legend>
+            <label for="problem-example">Example problem</label>
+            <select id="problem-example" name="problem-example" required disabled>
+              <option value="">Loading server examples…</option>
+            </select>
+            <p id="problem-description" class="field-note">The server provides this inventory.</p>
+
+            <div class="field-grid two-columns">
+              <div>
+                <label for="equity-template">Policy / equity template</label>
+                <select id="equity-template" name="equity-template" disabled></select>
+              </div>
+              <div id="group-floor-fields" class="group-floor-fields"></div>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Model and budgets</legend>
+            <div class="field-grid two-columns">
+              <div>
+                <label for="model-profile">Gemma 4 profile</label>
+                <select id="model-profile" name="model-profile" required disabled>
+                  <option value="">Loading model registry…</option>
+                </select>
+              </div>
+              <div>
+                <label for="model-id">Hugging Face model ID override</label>
+                <input id="model-id" name="model-id" type="text" placeholder="organization/model">
+              </div>
+            </div>
+
+            <div class="field-grid four-columns budget-fields">
+              <div>
+                <label for="wall-time">Wall time <span>ms</span></label>
+                <input id="wall-time" name="wall-time" type="number" min="250" value="30000" required>
+              </div>
+              <div>
+                <label for="total-tokens">Total tokens</label>
+                <input id="total-tokens" name="total-tokens" type="number" min="0" value="2000" required>
+              </div>
+              <div>
+                <label for="generated-tokens">Generated tokens</label>
+                <input id="generated-tokens" name="generated-tokens" type="number" min="0" value="256" required>
+              </div>
+              <div>
+                <label for="tool-calls">Tool calls</label>
+                <input id="tool-calls" name="tool-calls" type="number" min="0" value="8" required>
+              </div>
+            </div>
+
+            <label class="check-row" for="enable-model">
+              <input id="enable-model" name="enable-model" type="checkbox" checked>
+              <span>Let the model select search actions</span>
+            </label>
+          </fieldset>
+
+          <details class="advanced-controls">
+            <summary>Advanced runtime and trace controls</summary>
+            <div class="field-grid two-columns">
+              <div>
+                <label for="runtime-device">Device policy</label>
+                <select id="runtime-device" name="runtime-device" disabled>
+                  <option value="server">Use server policy</option>
+                </select>
+              </div>
+              <div>
+                <label for="runtime-engine">Runtime engine</label>
+                <select id="runtime-engine" name="runtime-engine" disabled>
+                  <option value="server">Use server policy</option>
+                </select>
+              </div>
+              <div>
+                <label for="runtime-dtype">Numeric dtype</label>
+                <select id="runtime-dtype" name="runtime-dtype" disabled></select>
+              </div>
+              <div>
+                <label for="runtime-quantization">Quantization</label>
+                <select id="runtime-quantization" name="runtime-quantization" disabled></select>
+              </div>
+            </div>
+            <label class="check-row" for="thinking-enabled">
+              <input id="thinking-enabled" name="thinking-enabled" type="checkbox">
+              <span>Enable model reasoning mode</span>
+            </label>
+            <p class="warning-note">
+              Reasoning tokens count against the budget. Private thought content is not shown or
+              required for auditability; only bounded rationales and controller events appear here.
+            </p>
+            <label class="check-row" for="show-trace">
+              <input id="show-trace" name="show-trace" type="checkbox" checked>
+              <span>Show the live action and tool trace</span>
+            </label>
+          </details>
+
+          <div id="form-error" class="notice error" role="alert" hidden></div>
+          <button id="launch-run" class="primary-action" type="submit" disabled>
+            Launch anytime run
+          </button>
+        </form>
+      </section>
+
+      <section id="run-panel" class="panel run-panel" aria-labelledby="run-title" hidden>
+        <div class="run-heading">
+          <div>
+            <p class="eyebrow">02 · VERIFIED INCUMBENT</p>
+            <h2 id="run-title">Run progress</h2>
+            <p id="run-identity" class="mono secondary"></p>
+          </div>
+          <div class="run-actions">
+            <span id="run-status" class="status-pill" aria-live="polite">Preparing</span>
+            <button id="cancel-run" class="secondary-action" type="button">Cancel run</button>
+          </div>
+        </div>
+
+        <div id="run-notices" class="notice-stack" aria-live="polite"></div>
+
+        <div class="metric-strip">
+          <article>
+            <p id="primary-metric-name">Primary metric</p>
+            <strong id="primary-metric-value">—</strong>
+          </article>
+          <article>
+            <p>Baseline improvement</p>
+            <strong id="baseline-improvement">—</strong>
+          </article>
+          <article>
+            <p>Wall budget remaining</p>
+            <strong id="wall-budget">—</strong>
+          </article>
+          <article>
+            <p>Model tokens consumed</p>
+            <strong id="token-budget">—</strong>
+          </article>
+        </div>
+
+        <div class="run-grid">
+          <article class="visual-card map-card" aria-labelledby="map-title">
+            <div class="card-heading">
+              <h3 id="map-title">Current valid plan</h3>
+              <div class="map-controls">
+                <span id="map-caption" class="secondary">Waiting for a feasible baseline</span>
+                <label class="visually-hidden" for="map-format">Map artifact format</label>
+                <select id="map-format" class="compact-select" aria-label="Map artifact format">
+                  <option value="geojson">GeoJSON</option>
+                  <option value="svg">SVG</option>
+                </select>
+              </div>
+            </div>
+            <div id="plan-map" class="map-canvas" role="img" aria-label="Current plan map">
+              <p class="empty-state">A map appears after the first independently verified plan.</p>
+            </div>
+            <div class="map-legend" aria-label="Map legend">
+              <span><i class="legend-site" aria-hidden="true"></i> Candidate</span>
+              <span><i class="legend-selected" aria-hidden="true"></i> Selected site</span>
+            </div>
+          </article>
+
+          <article class="visual-card chart-card" aria-labelledby="chart-title">
+            <div class="card-heading">
+              <h3 id="chart-title">Quality over time</h3>
+              <span class="secondary">Verified comparator</span>
+            </div>
+            <div id="quality-chart" class="chart-canvas">
+              <p class="empty-state">Incumbent checkpoints will appear here.</p>
+            </div>
+          </article>
+        </div>
+
+        <div class="detail-grid">
+          <article class="detail-card">
+            <h3>Overall metrics</h3>
+            <div id="overall-metrics" class="metric-table empty-state">No scorecard yet.</div>
+          </article>
+          <article class="detail-card">
+            <h3>Group metrics</h3>
+            <div id="group-metrics" class="metric-table empty-state">No subgroup metrics yet.</div>
+          </article>
+          <article class="detail-card">
+            <h3>Scenario metrics</h3>
+            <div id="scenario-metrics" class="metric-table empty-state">No scenario metrics yet.</div>
+          </article>
+          <article class="detail-card">
+            <h3>Evidence and outcome</h3>
+            <dl id="outcome-details" class="key-values"></dl>
+          </article>
+          <article class="detail-card wide-card">
+            <h3>Requested and resolved runtime</h3>
+            <div id="runtime-details" class="runtime-comparison"></div>
+          </article>
+        </div>
+
+        <article id="trace-card" class="trace-card" aria-labelledby="trace-title">
+          <div class="card-heading">
+            <h3 id="trace-title">Live action and tool trace</h3>
+            <span id="connection-state" class="secondary">Connecting…</span>
+          </div>
+          <ol id="event-trace" class="event-trace" aria-live="polite"></ol>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <p>Decision support, not clinical advice. Evidence age and assumptions remain visible.</p>
+    </footer>
+  </body>
+</html>

@@ -111,6 +111,7 @@ class ModelProfile(BaseModel):
     supports_thinking: bool = False
     supports_native_tools: bool = False
     is_custom: bool = False
+    estimated_parameter_count: int | None = Field(default=None, ge=1)
 
 
 class TokenUsage(BaseModel):

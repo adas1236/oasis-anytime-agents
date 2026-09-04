@@ -33,6 +33,10 @@ def test_explicit_model_id_overrides_profile() -> None:
     assert profile.is_custom
     assert profile.family == "custom"
 
+    registered_override = resolve_model_profile("gemma4_e2b_it", "google/gemma-4-31B-it")
+    assert registered_override.model_id == "google/gemma-4-31B-it"
+    assert registered_override.estimated_parameter_count == 31_000_000_000
+
 
 def test_unknown_profile_is_a_typed_error() -> None:
     with pytest.raises(ModelBackendError) as caught:

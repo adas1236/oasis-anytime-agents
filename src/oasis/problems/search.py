@@ -471,6 +471,13 @@ def solve_ortools(
         raise ValueError(
             "ortools_cp_sat requires one service scenario; use scenario_aware otherwise"
         )
+    scenario = problem.service_scenarios[0]
+    if (
+        scenario.access_matrix is not None
+        or scenario.demand_multiplier is not None
+        or scenario.failed_site_ids
+    ):
+        raise ValueError("ortools_cp_sat does not support scenario overrides")
     service = next(iter(data.services.values()))
     if not np.isin(service, (0.0, 1.0)).all():
         raise ValueError("ortools_cp_sat requires a binary service matrix")

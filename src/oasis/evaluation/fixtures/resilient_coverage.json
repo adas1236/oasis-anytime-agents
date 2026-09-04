@@ -1,0 +1,15 @@
+{
+  "generator_version": "1.0.0",
+  "family": "location_allocation",
+  "problem_type": "resilient_coverage",
+  "seed": 20260704,
+  "split": "held_out",
+  "scale": "small",
+  "distribution": "islands",
+  "demand_count": 8,
+  "candidate_count": 6,
+  "site_limit": 3,
+  "constraint_regime": "feasible",
+  "equity_structure": "isolated",
+  "scenario_count": 3
+}

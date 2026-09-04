@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from oasis.errors import ModelBackendError, ModelErrorCode, ModelErrorDetail
@@ -22,13 +22,11 @@ class DevicePolicy(StrEnum):
 
 
 class RuntimeEngine(StrEnum):
-    """Supported configuration values, including engines implemented in later phases."""
+    """Supported local and remote runtime choices."""
 
     AUTO = "auto"
     TRANSFORMERS = "transformers"
     ACCELERATE = "accelerate"
-    DEEPSPEED = "deepspeed"
-    VLLM = "vllm"
     REMOTE = "remote"
 
 
@@ -48,11 +46,18 @@ class RuntimeConfig(BaseModel):
     engine: RuntimeEngine = RuntimeEngine.AUTO
     dtype: str = "auto"
     quantization: str | None = None
-    parallelism: str = "auto"
+    attention_backend: str = "auto"
     memory_headroom_fraction: float = Field(default=0.10, ge=0.0, lt=1.0)
     allow_cpu_offload: bool = False
     allow_disk_offload: bool = False
+    offload_directory: Path = Path(".oasis/offload")
     remote_endpoint: HttpUrl | None = None
+    model_memory_bytes: int | None = Field(default=None, ge=1)
+
+
+# RuntimePolicy is the Phase 9 public name. RuntimeConfig remains as a compatibility alias for
+# the versioned Phase 8 API schema.
+RuntimePolicy = RuntimeConfig
 
 
 class OasisSettings(BaseSettings):
@@ -77,11 +82,15 @@ class OasisSettings(BaseSettings):
     runtime_engine: RuntimeEngine = RuntimeEngine.AUTO
     dtype: str = "auto"
     quantization: str | None = None
-    parallelism: str = "auto"
+    attention_backend: str = "auto"
     memory_headroom_fraction: float = Field(default=0.10, ge=0.0, lt=1.0)
     allow_cpu_offload: bool = False
     allow_disk_offload: bool = False
+    offload_root: Path = Path(".oasis/offload")
     remote_endpoint: HttpUrl | None = None
+    remote_auth_token: SecretStr | None = None
+    model_worker_auth_token: SecretStr | None = None
+    model_memory_bytes: int | None = Field(default=None, ge=1)
     artifact_root: Path = Path(".oasis/artifacts")
     provider_cache_root: Path = Path(".oasis/provider-cache")
     provider_user_agent: str = "oasis-anytime-agents/0.1 (configure OASIS_PROVIDER_USER_AGENT)"
@@ -90,6 +99,16 @@ class OasisSettings(BaseSettings):
     provider_backoff_base_seconds: float = Field(default=0.25, ge=0)
     provider_max_response_bytes: int = Field(default=10_000_000, ge=1)
     provider_max_pages: int = Field(default=20, ge=1)
+    run_root: Path = Path(".oasis/runs")
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65_535)
+    api_max_concurrent_runs: int = Field(default=2, ge=1, le=1_000)
+    api_max_request_bytes: int = Field(default=1_000_000, ge=1)
+    api_max_artifact_response_bytes: int = Field(default=25_000_000, ge=1)
+    api_sse_heartbeat_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
+    api_cancel_wait_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
+    serve_ui: bool = False
+    ui_root: Path = Path("ui")
 
     @classmethod
     def resolve(
@@ -114,11 +133,13 @@ class OasisSettings(BaseSettings):
             engine=self.runtime_engine,
             dtype=self.dtype,
             quantization=self.quantization,
-            parallelism=self.parallelism,
+            attention_backend=self.attention_backend,
             memory_headroom_fraction=self.memory_headroom_fraction,
             allow_cpu_offload=self.allow_cpu_offload,
             allow_disk_offload=self.allow_disk_offload,
+            offload_directory=self.offload_root,
             remote_endpoint=self.remote_endpoint,
+            model_memory_bytes=self.model_memory_bytes,
         )
 
 

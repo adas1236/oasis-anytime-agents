@@ -1,6 +1,7 @@
-# Project policy: ignore local planning notes while keeping the root README tracked.
+# Ignore local planning notes while tracking only the root README.
 *.md
 !/README.md
+HARDWARE_CHANGES.md
 
 # Python bytecode and environments
 __pycache__/

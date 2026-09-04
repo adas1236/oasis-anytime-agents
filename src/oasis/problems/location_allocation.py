@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -52,7 +53,10 @@ class LocationAllocationData:
     candidate_ids: tuple[str, ...]
     weights: np.ndarray
     access: np.ndarray
+    accesses: dict[str, np.ndarray]
     services: dict[str, np.ndarray]
+    demand_weights: dict[str, np.ndarray]
+    failed_sites: dict[str, frozenset[int]]
     scenario_weights: dict[str, float]
     costs: np.ndarray
     capacities: np.ndarray
@@ -69,6 +73,29 @@ def _hash(value: object) -> str:
 def problem_hashes(problem: LocationAllocationProblem) -> tuple[str, str, str]:
     """Recompute stable evidence, policy, and complete problem hashes."""
 
+    service_scenarios: list[dict[str, object]] = []
+    for scenario in problem.service_scenarios:
+        scenario_payload: dict[str, object] = {
+            "name": scenario.name,
+            "artifact_id": scenario.service_matrix.id,
+            "weight": scenario.weight,
+            "units": scenario.service_matrix.units,
+        }
+        if problem.schema_version != "1.0.0":
+            scenario_payload.update(
+                {
+                    "access_matrix_id": (
+                        scenario.access_matrix.id if scenario.access_matrix is not None else None
+                    ),
+                    "demand_multiplier_id": (
+                        scenario.demand_multiplier.id
+                        if scenario.demand_multiplier is not None
+                        else None
+                    ),
+                    "failed_site_ids": list(scenario.failed_site_ids),
+                }
+            )
+        service_scenarios.append(scenario_payload)
     evidence_payload = {
         "demand_artifact": {
             "id": problem.demand.artifact.id,
@@ -104,15 +131,7 @@ def problem_hashes(problem: LocationAllocationProblem) -> tuple[str, str, str]:
             "id": problem.access_matrix.id,
             "units": problem.access_matrix.units,
         },
-        "service_scenarios": [
-            {
-                "name": scenario.name,
-                "artifact_id": scenario.service_matrix.id,
-                "weight": scenario.weight,
-                "units": scenario.service_matrix.units,
-            }
-            for scenario in problem.service_scenarios
-        ],
+        "service_scenarios": service_scenarios,
         "need_field": problem.need_field,
         "groups": [group.model_dump(mode="json") for group in problem.groups],
     }
@@ -277,6 +296,9 @@ def load_problem_data(
         raise ProblemDataError("access values must be non-negative and cannot be NaN")
 
     services: dict[str, np.ndarray] = {}
+    accesses: dict[str, np.ndarray] = {}
+    demand_weights: dict[str, np.ndarray] = {}
+    failed_sites: dict[str, frozenset[int]] = {}
     scenario_weights: dict[str, float] = {}
     configured_weights = problem.policy.scenario_weights
     scenario_names = {scenario.name for scenario in problem.service_scenarios}
@@ -304,6 +326,51 @@ def load_problem_data(
         ):
             raise ProblemDataError("service benefits must be finite and between zero and one")
         services[scenario.name] = matrix.values
+        scenario_access = access.values
+        if scenario.access_matrix is not None:
+            scenario_access_ref = store.get_metadata(scenario.access_matrix.id)
+            if scenario_access_ref.kind is not ArtifactKind.MATRIX:
+                raise ProblemDataError("scenario access artifacts must be matrices")
+            if scenario_access_ref.units != access_ref.units:
+                raise ProblemDataError("scenario access units must match base access units")
+            scenario_access_matrix = read_matrix(store, scenario_access_ref)
+            if (
+                scenario_access_matrix.row_ids != demand_ids
+                or scenario_access_matrix.column_ids != candidate_ids
+            ):
+                raise ProblemDataError("scenario access labels must match demand/candidates")
+            if (
+                np.isnan(scenario_access_matrix.values).any()
+                or (scenario_access_matrix.values < 0).any()
+            ):
+                raise ProblemDataError("scenario access must be non-negative and cannot be NaN")
+            scenario_access = scenario_access_matrix.values
+        accesses[scenario.name] = scenario_access
+        multiplier = np.ones(len(demand_ids), dtype=np.float64)
+        if scenario.demand_multiplier is not None:
+            multiplier_ref = store.get_metadata(scenario.demand_multiplier.id)
+            if multiplier_ref.kind is not ArtifactKind.MATRIX:
+                raise ProblemDataError("demand multipliers must be matrix artifacts")
+            if multiplier_ref.units != "unitless":
+                raise ProblemDataError("demand multipliers must use unitless values")
+            multiplier_matrix = read_matrix(store, multiplier_ref)
+            if multiplier_matrix.row_ids != demand_ids or multiplier_matrix.column_ids != (
+                "multiplier",
+            ):
+                raise ProblemDataError("demand multiplier labels must be demand IDs by multiplier")
+            multiplier = multiplier_matrix.values[:, 0]
+            if not np.isfinite(multiplier).all() or (multiplier < 0).any():
+                raise ProblemDataError("demand multipliers must be finite and non-negative")
+        weighted_demand = weights * multiplier
+        if float(weighted_demand.sum()) <= FLOAT_TOLERANCE:
+            raise ProblemDataError("each scenario must retain positive total demand")
+        demand_weights[scenario.name] = weighted_demand
+        unknown_failed = sorted(set(scenario.failed_site_ids) - set(candidate_ids))
+        if unknown_failed:
+            raise ProblemDataError(f"scenario names unknown failed site IDs: {unknown_failed}")
+        failed_sites[scenario.name] = frozenset(
+            candidate_ids.index(identifier) for identifier in scenario.failed_site_ids
+        )
         scenario_weights[scenario.name] = configured_weights.get(scenario.name, scenario.weight)
 
     costs = _numeric_column(
@@ -331,7 +398,10 @@ def load_problem_data(
         candidate_ids=candidate_ids,
         weights=weights,
         access=access.values,
+        accesses=accesses,
         services=services,
+        demand_weights=demand_weights,
+        failed_sites=failed_sites,
         scenario_weights=scenario_weights,
         costs=costs,
         capacities=capacities,
@@ -347,7 +417,8 @@ def _issue(code: str, message: str, **context: Any) -> ValidationIssue:
 
 
 def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    return float(np.dot(values, weights) / weights.sum())
+    total = float(weights.sum())
+    return float(np.dot(values, weights) / total) if total > FLOAT_TOLERANCE else 0.0
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
@@ -368,17 +439,26 @@ def _selected_indices(plan: Plan, data: LocationAllocationData) -> tuple[int, ..
 def _coverage_by_scenario(
     selected: tuple[int, ...], data: LocationAllocationData
 ) -> dict[str, np.ndarray]:
-    if not selected:
-        return {name: np.zeros(len(data.demand_ids)) for name in data.services}
-    columns = np.array(selected, dtype=np.int64)
-    return {name: values[:, columns].max(axis=1) for name, values in data.services.items()}
+    result = {}
+    for name, values in data.services.items():
+        available = tuple(index for index in selected if index not in data.failed_sites[name])
+        result[name] = (
+            values[:, np.array(available, dtype=np.int64)].max(axis=1)
+            if available
+            else np.zeros(len(data.demand_ids))
+        )
+    return result
 
 
 def _aggregate_scenarios(
-    values: dict[str, float], problem: LocationAllocationProblem, data: LocationAllocationData
+    values: dict[str, float],
+    problem: LocationAllocationProblem,
+    data: LocationAllocationData,
+    *,
+    worst: Callable[[Iterable[float]], float] = min,
 ) -> float:
     if problem.policy.scenario_aggregation is ScenarioAggregation.WORST_CASE:
-        return min(values.values())
+        return float(worst(values.values()))
     total_weight = sum(data.scenario_weights.values())
     return sum(values[name] * data.scenario_weights[name] for name in values) / total_weight
 
@@ -394,17 +474,19 @@ def _coverage_metrics(
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, float]]]:
     per_demand = _coverage_by_scenario(selected, data)
     scenario_coverage = {
-        name: _weighted_mean(coverage, data.weights) for name, coverage in per_demand.items()
+        name: _weighted_mean(coverage, data.demand_weights[name])
+        for name, coverage in per_demand.items()
     }
     overall = _aggregate_scenarios(scenario_coverage, problem, data)
     scenario_metrics = {
-        name: {"coverage": coverage} for name, coverage in scenario_coverage.items()
+        name: {"coverage": coverage, "demand": float(data.demand_weights[name].sum())}
+        for name, coverage in scenario_coverage.items()
     }
     group_metrics: dict[str, dict[str, float]] = {}
     for name, membership in data.group_membership.items():
         group_weights = data.weights * membership
         by_scenario = {
-            scenario: _weighted_mean(coverage, group_weights)
+            scenario: _weighted_mean(coverage, data.demand_weights[scenario] * membership)
             for scenario, coverage in per_demand.items()
         }
         group_metrics[name] = {
@@ -535,6 +617,18 @@ class LocationAllocationPlugin:
                 issues.append(
                     _issue("missing_capacity", "capacitated allocation requires capacities")
                 )
+            if any(
+                scenario.access_matrix is not None
+                or scenario.demand_multiplier is not None
+                or scenario.failed_site_ids
+                for scenario in spec.service_scenarios
+            ):
+                issues.append(
+                    _issue(
+                        "unsupported_capacity_scenario",
+                        "capacity allocation currently accepts only service-benefit scenarios",
+                    )
+                )
         if self.problem_type is LocationProblemType.EQUITY_COVERAGE:
             if policy.equity_objective is EquityObjective.NONE:
                 issues.append(
@@ -569,12 +663,27 @@ class LocationAllocationPlugin:
             LocationProblemType.P_CENTER,
             LocationProblemType.QUANTILE_ACCESS,
         }:
-            usable = data.eligible | data.existing
-            unreachable_rows = np.isinf(data.access[:, usable]).all(axis=1)
-            if np.any(unreachable_rows & (data.weights > 0)):
-                issues.append(
-                    _issue("unreachable_demand", "positive demand lacks any reachable site")
+            for name, scenario_access in data.accesses.items():
+                usable = np.array(
+                    [
+                        (data.eligible[index] or data.existing[index])
+                        and index not in data.failed_sites[name]
+                        for index in range(len(data.candidate_ids))
+                    ],
+                    dtype=np.bool_,
                 )
+                unreachable_rows = (
+                    np.ones(len(data.demand_ids), dtype=np.bool_)
+                    if not usable.any()
+                    else np.isinf(scenario_access[:, usable]).all(axis=1)
+                )
+                if np.any(unreachable_rows & (data.demand_weights[name] > 0)):
+                    issues.append(
+                        _issue(
+                            "unreachable_demand",
+                            f"positive demand lacks any reachable site in {name}",
+                        )
+                    )
         return ValidationReport(valid=not issues, issues=tuple(issues))
 
     def make_baseline(self, spec: object, store: ArtifactStore, deadline: Deadline) -> Plan:
@@ -664,10 +773,21 @@ class LocationAllocationPlugin:
                 issues.append(
                     _issue("no_selected_site", "access plans must select at least one site")
                 )
-            elif np.any(np.isinf(data.access[:, selected]).all(axis=1) & (data.weights > 0)):
-                issues.append(
-                    _issue("unserved_access", "selected sites leave positive demand unreachable")
-                )
+            else:
+                for name, scenario_access in data.accesses.items():
+                    available = tuple(
+                        index for index in selected if index not in data.failed_sites[name]
+                    )
+                    if not available or np.any(
+                        np.isinf(scenario_access[:, available]).all(axis=1)
+                        & (data.demand_weights[name] > 0)
+                    ):
+                        issues.append(
+                            _issue(
+                                "unserved_access",
+                                f"selected sites leave positive demand unreachable in {name}",
+                            )
+                        )
         if (
             self.problem_type is LocationProblemType.RESILIENT_COVERAGE
             and len(selected) < policy.redundancy
@@ -799,31 +919,67 @@ class LocationAllocationPlugin:
             LocationProblemType.P_CENTER,
             LocationProblemType.QUANTILE_ACCESS,
         }:
-            nearest = data.access[:, selected].min(axis=1)
-            average = _weighted_mean(nearest, data.weights)
+            by_scenario: dict[str, dict[str, float]] = {}
+            group_by_scenario: dict[str, dict[str, dict[str, float]]] = {
+                name: {} for name in data.group_membership
+            }
+            for scenario, scenario_access in data.accesses.items():
+                available = tuple(
+                    index for index in selected if index not in data.failed_sites[scenario]
+                )
+                nearest = scenario_access[:, available].min(axis=1)
+                scenario_weights = data.demand_weights[scenario]
+                by_scenario[scenario] = {
+                    "average_access": _weighted_mean(nearest, scenario_weights),
+                    "maximum_access": float(nearest[scenario_weights > 0].max()),
+                    "quantile_access": _weighted_quantile(
+                        nearest, scenario_weights, problem.policy.quantile
+                    ),
+                    "demand": float(scenario_weights.sum()),
+                }
+                for name, membership in data.group_membership.items():
+                    group_weights = scenario_weights * membership
+                    positive = group_weights > 0
+                    group_by_scenario[name][scenario] = {
+                        "average_access": _weighted_mean(nearest, group_weights),
+                        "maximum_access": float(nearest[positive].max()) if positive.any() else 0.0,
+                        "quantile_access": (
+                            _weighted_quantile(nearest, group_weights, problem.policy.quantile)
+                            if positive.any()
+                            else 0.0
+                        ),
+                    }
+            overall_access = {
+                metric: _aggregate_scenarios(
+                    {name: values[metric] for name, values in by_scenario.items()},
+                    problem,
+                    data,
+                    worst=max,
+                )
+                for metric in ("average_access", "maximum_access", "quantile_access")
+            }
             group_access: dict[str, dict[str, float]] = {}
             for name, membership in data.group_membership.items():
-                group_weights = data.weights * membership
-                positive = group_weights > 0
                 group_access[name] = {
-                    "demand": float(group_weights.sum()),
-                    "average_access": _weighted_mean(nearest, group_weights),
-                    "maximum_access": float(nearest[positive].max()),
-                    "quantile_access": _weighted_quantile(
-                        nearest, group_weights, problem.policy.quantile
-                    ),
+                    "demand": float(np.dot(data.weights, membership)),
+                    **{
+                        metric: _aggregate_scenarios(
+                            {
+                                scenario: values[metric]
+                                for scenario, values in group_by_scenario[name].items()
+                            },
+                            problem,
+                            data,
+                            worst=max,
+                        )
+                        for metric in (
+                            "average_access",
+                            "maximum_access",
+                            "quantile_access",
+                        )
+                    },
                 }
-            return (
-                {
-                    "average_access": average,
-                    "maximum_access": float(nearest.max()),
-                    "quantile_access": _weighted_quantile(
-                        nearest, data.weights, problem.policy.quantile
-                    ),
-                },
-                group_access,
-                {},
-            )
+            return overall_access, group_access, by_scenario
         overall, groups, scenarios = _coverage_metrics(problem, data, selected)
         if self.problem_type is LocationProblemType.RESILIENT_COVERAGE:
             failure_values: list[float] = []

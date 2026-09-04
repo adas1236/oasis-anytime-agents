@@ -9,6 +9,7 @@ from oasis.llm.adapters import (
 from oasis.llm.fake import FakeModelBackend
 from oasis.llm.profiles import DEFAULT_PROFILE_NAME, MODEL_PROFILES, resolve_model_profile
 from oasis.llm.protocols import ConversationAdapter, ModelBackend
+from oasis.llm.runtime_backend import RuntimeModelBackend
 from oasis.llm.schemas import (
     ChatMessage,
     ChatRole,
@@ -39,6 +40,7 @@ __all__ = [
     "ModelRequest",
     "ModelTurn",
     "PlainChatAdapter",
+    "RuntimeModelBackend",
     "TokenUsage",
     "ToolCall",
     "ToolDefinition",

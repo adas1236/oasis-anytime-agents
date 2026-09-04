@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "OASIS contributors" }]
 dependencies = [
-  "accelerate>=1.10,<2",
   "fastapi>=0.116,<1",
   "geopandas>=1.1,<2",
   "httpx>=0.28,<1",
@@ -29,8 +28,6 @@ dependencies = [
   "shapely>=2.1,<3",
   "sse-starlette>=3,<4",
   "tenacity>=9.1,<10",
-  "torch>=2.8,<3",
-  "torchvision>=0.23,<1",
   "transformers>=5.10.1,<6",
   "uvicorn>=0.35,<1",
 ]
@@ -39,6 +36,18 @@ dependencies = [
 oasis = "oasis.cli:main"
 
 [dependency-groups]
+# uv cannot install CPU and CUDA PyTorch wheels in one environment. Keep CPU as
+# the default group so a bare `uv sync` remains the safe, complete V1 setup.
+cpu = [
+  "accelerate>=1.10,<2",
+  "torch>=2.8,<3",
+  "torchvision>=0.23,<1",
+]
+gpu = [
+  "accelerate>=1.10,<2",
+  "torch>=2.8,<3",
+  "torchvision>=0.23,<1",
+]
 dev = [
   "hypothesis>=6.138,<7",
   "mypy>=1.17,<2",
@@ -50,14 +59,32 @@ dev = [
 
 [tool.uv]
 cache-dir = ".uv-cache"
+conflicts = [
+  [
+    { group = "cpu" },
+    { group = "gpu" },
+  ],
+]
+default-groups = ["cpu", "dev"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
+torch = [
+  { index = "pytorch-cu128", group = "gpu" },
+  { index = "pytorch-cpu", group = "cpu" },
+]
+torchvision = [
+  { index = "pytorch-cu128", group = "gpu" },
+  { index = "pytorch-cpu", group = "cpu" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.hatch.build.targets.wheel]
@@ -102,6 +129,5 @@ markers = [
   "model: downloads or loads real model weights (opt in)",
   "gpu: initializes one CUDA device (opt in)",
   "multi_gpu: initializes multiple accelerator devices (opt in)",
-  "slurm: requires an allocated SLURM environment (opt in)",
   "slow: exceeds the normal unit-test latency budget (opt in)",
 ]

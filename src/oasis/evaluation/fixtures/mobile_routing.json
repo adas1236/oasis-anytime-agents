@@ -1,0 +1,16 @@
+{
+  "generator_version": "1.0.0",
+  "family": "routing",
+  "problem_type": "mobile_service_route",
+  "seed": 20260705,
+  "split": "held_out",
+  "scale": "small",
+  "distribution": "corridor",
+  "demand_count": 5,
+  "candidate_count": 5,
+  "site_limit": 2,
+  "constraint_regime": "tight",
+  "equity_structure": "none",
+  "directed_travel": true,
+  "scenario_count": 2
+}

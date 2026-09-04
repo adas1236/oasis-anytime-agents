@@ -21,6 +21,13 @@ from oasis.llm.schemas import (
     TokenUsage,
     ToolCall,
 )
+from oasis.runtimes.inventory import fake_inventory
+from oasis.runtimes.schemas import (
+    ComputeInventory,
+    HardwareValidationStatus,
+    RuntimeKind,
+    RuntimePlan,
+)
 
 
 def _count_tokens(text: str) -> int:
@@ -46,12 +53,25 @@ class FakeModelBackend:
         *,
         chunk_size: int = 5,
         profile: ModelProfile | None = None,
+        inventory: ComputeInventory | None = None,
+        runtime_plan: RuntimePlan | None = None,
     ) -> None:
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
         self._responses = tuple(responses)
         self._chunk_size = chunk_size
         self._profile = profile or resolve_model_profile()
+        self._inventory = inventory or fake_inventory()
+        self._runtime_plan = runtime_plan or RuntimePlan(
+            requested_profile=self._profile.name,
+            requested_model_id=self._profile.model_id,
+            runtime=RuntimeKind.FAKE,
+            device_placement=("cpu",),
+            dtype="fake",
+            attention_backend="fake",
+            rationale=("Deterministic fake runtime; no model weights or accelerators are used.",),
+            hardware_validation=HardwareValidationStatus.NOT_APPLICABLE,
+        )
         self._response_index = 0
         self._abort_events: dict[str, asyncio.Event] = {}
         self._closed = False
@@ -72,6 +92,27 @@ class FakeModelBackend:
     @property
     def capabilities(self) -> ModelCapabilities:
         return self._capabilities
+
+    @property
+    def is_loaded(self) -> bool:
+        return True
+
+    @property
+    def runtime_plan(self) -> RuntimePlan:
+        return self._runtime_plan
+
+    @property
+    def compute_inventory(self) -> ComputeInventory:
+        return self._inventory
+
+    async def load(self) -> None:
+        """Satisfy the shared lifecycle hook without performing work."""
+
+    async def count_input_tokens(self, request: ModelRequest) -> int:
+        """Return the exact deterministic count that will appear in terminal usage."""
+
+        count = sum(_count_tokens(message.model_dump_json()) for message in request.messages)
+        return count + sum(_count_tokens(tool.model_dump_json()) for tool in request.tools)
 
     def _next_response(self, request: ModelRequest) -> str | ToolCall:
         if self._response_index < len(self._responses):
@@ -128,10 +169,7 @@ class FakeModelBackend:
             if tool_calls and not abort_event.is_set():
                 yield ModelDelta(tool_calls=tool_calls)
             cancelled = abort_event.is_set()
-            input_tokens = sum(
-                _count_tokens(message.model_dump_json()) for message in request.messages
-            )
-            input_tokens += sum(_count_tokens(tool.model_dump_json()) for tool in request.tools)
+            input_tokens = await self.count_input_tokens(request)
             generated_tokens = _count_tokens(emitted) + _count_tokens(thought)
             if tool_calls:
                 generated_tokens += _count_tokens(

@@ -39,3 +39,18 @@ class ProblemRegistry:
 
     def list(self) -> tuple[ProblemPlugin, ...]:
         return tuple(self._plugins[key] for key in sorted(self._plugins))
+
+
+def create_builtin_problem_registry() -> ProblemRegistry:
+    """Create every built-in problem plugin without import-time registration."""
+
+    from oasis.problems.location_allocation import LocationAllocationPlugin
+    from oasis.problems.routing import RouteServicePlugin
+    from oasis.problems.schemas import LocationProblemType, RouteProblemType
+
+    return ProblemRegistry(
+        (
+            *(LocationAllocationPlugin(type_id) for type_id in LocationProblemType),
+            *(RouteServicePlugin(type_id) for type_id in RouteProblemType),
+        )
+    )

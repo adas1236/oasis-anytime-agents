@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
 from oasis.artifacts import ArtifactProvenance, put_json, read_json
-from oasis.problems.schemas import LocationAllocationProblem, Scorecard
+from oasis.problems.schemas import LocationAllocationProblem, RouteServiceProblem, Scorecard
 from oasis.schemas import (
     ArtifactKind,
     ArtifactLineage,
@@ -20,15 +20,18 @@ from oasis.tools.protocols import ToolContext
 
 def read_problem(
     context: ToolContext, artifact_id: str
-) -> tuple[ArtifactRef, LocationAllocationProblem]:
+) -> tuple[ArtifactRef, LocationAllocationProblem | RouteServiceProblem]:
     reference = artifact_ref(context, artifact_id)
     require_kind(reference, {ArtifactKind.JSON_SPECIFICATION})
+    payload = read_json(context.artifact_store, reference)
+    if not isinstance(payload, dict):
+        invalid("invalid problem artifact: expected a JSON object")
     try:
-        problem = LocationAllocationProblem.model_validate(
-            read_json(context.artifact_store, reference)
-        )
+        problem: LocationAllocationProblem | RouteServiceProblem = TypeAdapter(
+            LocationAllocationProblem | RouteServiceProblem
+        ).validate_python(payload)
     except ValueError as error:
-        invalid(f"invalid LocationAllocationProblem artifact: {error}")
+        invalid(f"invalid problem artifact: {error}")
     return reference, problem
 
 

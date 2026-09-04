@@ -39,6 +39,17 @@ async def test_fake_generate_collects_a_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fake_backend_precounts_the_exact_rendered_input() -> None:
+    backend = FakeModelBackend(["ok"])
+    model_request = request()
+
+    count = await backend.count_input_tokens(model_request)
+    turn = await backend.generate(model_request)
+
+    assert count == turn.usage.input_tokens
+
+
+@pytest.mark.asyncio
 async def test_fake_backend_abort_is_cooperative() -> None:
     backend = FakeModelBackend(["a response long enough to cancel"], chunk_size=2)
     stream = backend.stream(request("cancel-me"))

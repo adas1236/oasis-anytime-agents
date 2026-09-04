@@ -11,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from shapely.geometry import mapping
 
 from oasis.artifacts import canonical_json_bytes, put_json, read_vector
-from oasis.problems.location_allocation import create_problem_registry
-from oasis.problems.registry import ProblemRegistry
+from oasis.problems.registry import ProblemRegistry, create_builtin_problem_registry
+from oasis.problems.schemas import LocationAllocationProblem
 from oasis.schemas import (
     ArtifactKind,
     ArtifactMetadata,
@@ -44,24 +44,27 @@ class SummarizePlanOutput(BaseModel):
     scorecard_artifact_id: str
     feasible: bool
     selected_site_count: int = Field(ge=0)
+    route_count: int = Field(ge=0)
     comparator_key: tuple[float, ...]
 
 
 class SummarizePlanTool:
     """Independently score a plan and publish a deterministic compact summary."""
 
-    version = "1.0.0"
+    version = "1.1.0"
     spec = ToolSpec(
         name="summarize_plan",
         version=version,
         description=(
-            "Validate and independently score a location plan, then publish a deterministic "
-            "summary containing raw overall, group, and scenario metrics."
+            "Validate and independently score a location or route plan, then publish a "
+            "deterministic summary containing raw overall, group, and scenario metrics."
         ),
         input_schema=SummarizePlanInput.model_json_schema(),
         output_schema=SummarizePlanOutput.model_json_schema(),
-        capability_tags=frozenset({"decision", "summary", "location_allocation", "offline"}),
-        problem_tags=frozenset({"location_allocation"}),
+        capability_tags=frozenset(
+            {"decision", "summary", "location_allocation", "routing", "offline"}
+        ),
+        problem_tags=frozenset({"location_allocation", "routing"}),
         artifact_tags=frozenset(
             {ArtifactKind.JSON_SPECIFICATION, ArtifactKind.PLAN, ArtifactKind.SCORECARD}
         ),
@@ -75,7 +78,7 @@ class SummarizePlanTool:
     )
 
     def __init__(self, registry: ProblemRegistry | None = None) -> None:
-        self._registry = registry or create_problem_registry()
+        self._registry = registry or create_builtin_problem_registry()
 
     async def run(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         request = SummarizePlanInput.model_validate(arguments)
@@ -126,6 +129,7 @@ class SummarizePlanTool:
             scorecard_artifact_id=score_ref.id,
             feasible=score.feasible,
             selected_site_count=len(plan.selected_site_ids),
+            route_count=len(plan.routes),
             comparator_key=score.comparator_key,
         )
         compact_metrics: dict[str, JsonValue] = {
@@ -136,6 +140,7 @@ class SummarizePlanTool:
             "scorecard": score_ref.id,
             "feasible": score.feasible,
             "selected_sites": len(plan.selected_site_ids),
+            "routes": len(plan.routes),
             "overall_metrics": compact_metrics,
         }
         return ToolResult(
@@ -167,7 +172,13 @@ class RenderMapOutput(BaseModel):
     selected_site_count: int = Field(ge=0)
 
 
-def _geojson(frame: Any, id_field: str, selected: set[str]) -> bytes:
+def _geojson(
+    frame: Any,
+    id_field: str,
+    selected: set[str],
+    problem_hash: str,
+    plan_artifact_id: str,
+) -> bytes:
     features = []
     for _, row in frame.sort_values(id_field, kind="stable").iterrows():
         identifier = str(row[id_field])
@@ -178,10 +189,25 @@ def _geojson(frame: Any, id_field: str, selected: set[str]) -> bytes:
                 "properties": {"site_id": identifier, "selected": identifier in selected},
             }
         )
-    return canonical_json_bytes({"type": "FeatureCollection", "features": features})
+    return canonical_json_bytes(
+        {
+            "type": "FeatureCollection",
+            "properties": {
+                "problem_hash": problem_hash,
+                "plan_artifact_id": plan_artifact_id,
+            },
+            "features": features,
+        }
+    )
 
 
-def _svg(frame: Any, id_field: str, selected: set[str]) -> bytes:
+def _svg(
+    frame: Any,
+    id_field: str,
+    selected: set[str],
+    problem_hash: str,
+    plan_artifact_id: str,
+) -> bytes:
     width, height, padding = 640.0, 480.0, 30.0
     min_x, min_y, max_x, max_y = (float(value) for value in frame.total_bounds)
     span_x = max(max_x - min_x, 1.0)
@@ -199,6 +225,8 @@ def _svg(frame: Any, id_field: str, selected: set[str]) -> bytes:
         )
     payload = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0f} {height:.0f}" '
+        f'data-problem-hash="{html.escape(problem_hash)}" '
+        f'data-plan-artifact-id="{html.escape(plan_artifact_id)}" '
         'role="img" aria-label="Location-allocation candidate map">'
         '<rect width="100%" height="100%" fill="#f8fafc"/>' + "".join(circles) + "</svg>"
     )
@@ -231,11 +259,13 @@ class RenderMapTool:
     )
 
     def __init__(self, registry: ProblemRegistry | None = None) -> None:
-        self._registry = registry or create_problem_registry()
+        self._registry = registry or create_builtin_problem_registry()
 
     async def run(self, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         request = RenderMapInput.model_validate(arguments)
         problem_ref, problem = read_problem(context, request.problem_artifact_id)
+        if not isinstance(problem, LocationAllocationProblem):
+            invalid("render_map currently supports location-allocation problems")
         plan_ref, plan = read_plan(context, request.plan_artifact_id)
         plugin = self._registry.get(problem.type_id.value)
         problem_report = plugin.validate_spec(problem, context.artifact_store)
@@ -247,9 +277,21 @@ class RenderMapTool:
         frame = read_vector(context.artifact_store, problem.candidates.artifact)
         selected = set(plan.selected_site_ids)
         content = (
-            _geojson(frame, problem.candidates.candidate_id_field, selected)
+            _geojson(
+                frame,
+                problem.candidates.candidate_id_field,
+                selected,
+                problem.problem_hash,
+                plan_ref.id,
+            )
             if request.format is MapFormat.GEOJSON
-            else _svg(frame, problem.candidates.candidate_id_field, selected)
+            else _svg(
+                frame,
+                problem.candidates.candidate_id_field,
+                selected,
+                problem.problem_hash,
+                plan_ref.id,
+            )
         )
         media_type = (
             "application/geo+json" if request.format is MapFormat.GEOJSON else "image/svg+xml"

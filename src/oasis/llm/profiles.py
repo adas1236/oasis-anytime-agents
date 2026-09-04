@@ -18,6 +18,9 @@ _MODEL_PROFILES = {
         context_limit=131_072,
         supports_thinking=True,
         supports_native_tools=True,
+        # E2B describes active/effective parameters. Placement must reserve for
+        # the complete multimodal checkpoint, measured at 5.104B parameters.
+        estimated_parameter_count=5_200_000_000,
     ),
     "gemma4_e4b_it": ModelProfile(
         name="gemma4_e4b_it",
@@ -26,6 +29,7 @@ _MODEL_PROFILES = {
         context_limit=131_072,
         supports_thinking=True,
         supports_native_tools=True,
+        estimated_parameter_count=4_000_000_000,
     ),
     "gemma4_12b_it": ModelProfile(
         name="gemma4_12b_it",
@@ -34,6 +38,7 @@ _MODEL_PROFILES = {
         context_limit=262_144,
         supports_thinking=True,
         supports_native_tools=True,
+        estimated_parameter_count=12_000_000_000,
     ),
     "gemma4_26b_a4b_it": ModelProfile(
         name="gemma4_26b_a4b_it",
@@ -42,6 +47,7 @@ _MODEL_PROFILES = {
         context_limit=262_144,
         supports_thinking=True,
         supports_native_tools=True,
+        estimated_parameter_count=26_000_000_000,
     ),
     "gemma4_31b_it": ModelProfile(
         name="gemma4_31b_it",
@@ -50,6 +56,7 @@ _MODEL_PROFILES = {
         context_limit=262_144,
         supports_thinking=True,
         supports_native_tools=True,
+        estimated_parameter_count=31_000_000_000,
     ),
 }
 
@@ -63,16 +70,26 @@ def resolve_model_profile(
     """Resolve a profile, with an explicit Hugging Face ID taking precedence."""
 
     if explicit_model_id:
-        base = _MODEL_PROFILES.get(profile_name)
+        registered = next(
+            (
+                candidate
+                for candidate in _MODEL_PROFILES.values()
+                if candidate.model_id == explicit_model_id
+            ),
+            None,
+        )
         family = "gemma4" if explicit_model_id.lower().startswith("google/gemma-4-") else "custom"
         return ModelProfile(
             name="custom",
             model_id=explicit_model_id,
             family=family,
-            context_limit=base.context_limit if base and family == "gemma4" else None,
+            context_limit=registered.context_limit if registered is not None else None,
             supports_thinking=family == "gemma4",
             supports_native_tools=family == "gemma4",
             is_custom=True,
+            estimated_parameter_count=(
+                registered.estimated_parameter_count if registered is not None else None
+            ),
         )
     try:
         return _MODEL_PROFILES[profile_name]

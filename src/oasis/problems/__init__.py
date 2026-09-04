@@ -9,7 +9,19 @@ from oasis.problems.location_allocation import (
     problem_hashes,
 )
 from oasis.problems.protocols import Deadline, ProblemPlugin
-from oasis.problems.registry import ProblemRegistry, ProblemRegistryError
+from oasis.problems.registry import (
+    ProblemRegistry,
+    ProblemRegistryError,
+    create_builtin_problem_registry,
+)
+from oasis.problems.routing import (
+    RouteDataError,
+    RouteServiceData,
+    RouteServicePlugin,
+    load_route_data,
+    route_plan_hash,
+    route_problem_hashes,
+)
 from oasis.problems.schemas import (
     Comparison,
     EquityGroup,
@@ -18,6 +30,10 @@ from oasis.problems.schemas import (
     LocationAllocationProblem,
     LocationProblemType,
     ResultView,
+    RouteProblemType,
+    RouteScenario,
+    RouteServicePolicy,
+    RouteServiceProblem,
     ScenarioAggregation,
     Scorecard,
     SearchResumeToken,
@@ -42,6 +58,13 @@ __all__ = [
     "ProblemRegistry",
     "ProblemRegistryError",
     "ResultView",
+    "RouteDataError",
+    "RouteProblemType",
+    "RouteScenario",
+    "RouteServiceData",
+    "RouteServicePlugin",
+    "RouteServicePolicy",
+    "RouteServiceProblem",
     "ScenarioAggregation",
     "Scorecard",
     "SearchResumeToken",
@@ -50,8 +73,12 @@ __all__ = [
     "ValidationIssue",
     "ValidationReport",
     "VerifiedBound",
+    "create_builtin_problem_registry",
     "create_problem_registry",
     "load_problem_data",
+    "load_route_data",
     "plan_hash",
     "problem_hashes",
+    "route_plan_hash",
+    "route_problem_hashes",
 ]

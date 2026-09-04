@@ -1,0 +1,15 @@
+{
+  "generator_version": "1.0.0",
+  "family": "location_allocation",
+  "problem_type": "weighted_p_median",
+  "seed": 20260702,
+  "split": "held_out",
+  "scale": "small",
+  "distribution": "corridor",
+  "demand_count": 8,
+  "candidate_count": 6,
+  "site_limit": 2,
+  "constraint_regime": "feasible",
+  "equity_structure": "isolated",
+  "directed_travel": true
+}

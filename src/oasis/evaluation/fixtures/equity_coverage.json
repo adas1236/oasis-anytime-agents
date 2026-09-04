@@ -1,0 +1,15 @@
+{
+  "generator_version": "1.0.0",
+  "family": "location_allocation",
+  "problem_type": "equity_coverage",
+  "seed": 20260708,
+  "split": "held_out",
+  "scale": "small",
+  "distribution": "islands",
+  "demand_count": 10,
+  "candidate_count": 7,
+  "site_limit": 2,
+  "constraint_regime": "tight",
+  "equity_structure": "isolated",
+  "scenario_count": 2
+}

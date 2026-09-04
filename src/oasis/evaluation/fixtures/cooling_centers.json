@@ -1,0 +1,15 @@
+{
+  "generator_version": "1.0.0",
+  "family": "location_allocation",
+  "problem_type": "max_weighted_coverage",
+  "seed": 20260701,
+  "split": "held_out",
+  "scale": "small",
+  "distribution": "clustered",
+  "demand_count": 9,
+  "candidate_count": 6,
+  "site_limit": 2,
+  "constraint_regime": "tight",
+  "equity_structure": "isolated",
+  "scenario_count": 2
+}

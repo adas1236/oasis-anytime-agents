@@ -1,10 +1,11 @@
-"""Command-line entry point for chat and tool inspection."""
+"""Command-line entry point for chat, workflows, tools, and the service API."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from collections.abc import Sequence
@@ -14,16 +15,16 @@ import geopandas as gpd
 import httpx
 from shapely.geometry import Point
 
+from oasis.anytime import run_anytime_demo
 from oasis.artifacts import ArtifactProvenance, LocalArtifactStore, put_vector
-from oasis.config import BackendKind, DevicePolicy, OasisSettings
+from oasis.config import BackendKind, DevicePolicy, OasisSettings, RuntimeEngine
 from oasis.decision import run_decision_demo
 from oasis.errors import ModelBackendError
 from oasis.evidence import run_evidence_demo
-from oasis.llm.fake import FakeModelBackend
+from oasis.llm.factory import create_model_backend
 from oasis.llm.profiles import MODEL_PROFILES, resolve_model_profile
 from oasis.llm.protocols import ModelBackend
 from oasis.llm.schemas import ChatMessage, ChatRole, ModelRequest, TokenUsage
-from oasis.llm.transformers_backend import TransformersModelBackend
 from oasis.providers import (
     HttpPolicy,
     HttpSourceSnapshotProvider,
@@ -32,6 +33,16 @@ from oasis.providers import (
     OsrmRoutingMatrixProvider,
     ResilientHttpClient,
     SourceFormat,
+)
+from oasis.routing import run_routing_demo
+from oasis.runtimes import (
+    ComputeInventory,
+    ConservativeRuntimePlanner,
+    RemoteModelRuntime,
+    RuntimePlanningError,
+    inspect_cuda_inventory,
+    named_fake_inventory,
+    safe_cpu_inventory,
 )
 from oasis.schemas import ToolResult, ToolResultStatus
 from oasis.tools import CancellationToken, ToolContext, create_tool_registry, invoke_tool
@@ -53,7 +64,15 @@ def _parser() -> argparse.ArgumentParser:
     chat.add_argument("--model", dest="model_id", help="explicit Hugging Face model ID")
     chat.add_argument("--revision", dest="model_revision")
     chat.add_argument("--device", choices=[policy.value for policy in DevicePolicy])
+    chat.add_argument("--engine", choices=[engine.value for engine in RuntimeEngine])
     chat.add_argument("--dtype")
+    chat.add_argument("--quantization", choices=["int8", "int4"])
+    chat.add_argument("--attention-backend")
+    chat.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly inspect visible CUDA devices before resolving the runtime",
+    )
     chat.add_argument("--max-generated-tokens", type=int)
     thinking = chat.add_mutually_exclusive_group()
     thinking.add_argument("--thinking", dest="thinking", action="store_true", default=None)
@@ -126,36 +145,192 @@ def _parser() -> argparse.ArgumentParser:
     decision_demo.add_argument(
         "--artifact-root", type=Path, default=Path("artifacts/decision-demo")
     )
+    routing_demo = decision_commands.add_parser(
+        "mobile-demo", help="run the frozen Phase 6 mobile-vaccination workflow"
+    )
+    routing_demo.add_argument(
+        "--artifact-root", type=Path, default=Path("artifacts/mobile-routing-demo")
+    )
+    anytime_demo = decision_commands.add_parser(
+        "anytime-demo", help="run the Phase 7 fake-model anytime coverage workflow"
+    )
+    anytime_demo.add_argument("--artifact-root", type=Path, default=Path("artifacts/anytime-demo"))
+    anytime_demo.add_argument("--wall-time-ms", type=int, default=30_000)
+    anytime_demo.add_argument("--max-total-model-tokens", type=int, default=2_000)
+    anytime_demo.add_argument("--max-generated-tokens", type=int, default=256)
+    anytime_demo.add_argument("--max-tool-calls", type=int, default=2)
+
+    serve = subparsers.add_parser("serve", help="serve the versioned HTTP/SSE API")
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--backend", choices=[kind.value for kind in BackendKind])
+    serve.add_argument("--profile", choices=sorted(MODEL_PROFILES))
+    serve.add_argument("--model", dest="model_id", help="explicit Hugging Face model ID")
+    serve.add_argument("--revision", dest="model_revision")
+    serve.add_argument("--device", choices=[policy.value for policy in DevicePolicy])
+    serve.add_argument("--engine", choices=[engine.value for engine in RuntimeEngine])
+    serve.add_argument("--dtype")
+    serve.add_argument("--quantization", choices=["int8", "int4"])
+    serve.add_argument("--attention-backend")
+    serve.add_argument("--remote-endpoint")
+    serve.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly inspect visible CUDA devices before starting the service",
+    )
+    serve.add_argument("--artifact-root", type=Path)
+    serve.add_argument("--run-root", type=Path)
+    serve.add_argument("--max-concurrent-runs", type=int)
+    serve.add_argument("--max-request-bytes", type=int)
+    serve.add_argument("--max-artifact-response-bytes", type=int)
+    ui = serve.add_mutually_exclusive_group()
+    ui.add_argument("--serve-ui", dest="serve_ui", action="store_true", default=None)
+    ui.add_argument("--no-serve-ui", dest="serve_ui", action="store_false")
+    serve.add_argument("--ui-root", type=Path)
+
+    hardware = subparsers.add_parser("hardware", help="inspect safe or explicitly probed hardware")
+    hardware_commands = hardware.add_subparsers(dest="hardware_command", required=True)
+    inspect = hardware_commands.add_parser("inspect", help="print a typed compute inventory")
+    inventory_source = inspect.add_mutually_exclusive_group()
+    inventory_source.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly import Torch and inspect CUDA devices visible to this process",
+    )
+    inventory_source.add_argument(
+        "--fixture",
+        choices=[
+            "cpu",
+            "local-5060ti-8gb",
+            "local-5060ti-16gb",
+            "2x24gb",
+            "4x80gb",
+        ],
+        help="use a named fake inventory without probing real hardware",
+    )
+
+    runtime = subparsers.add_parser(
+        "runtime", help="resolve runtime placement without loading a model"
+    )
+    runtime_commands = runtime.add_subparsers(dest="runtime_command", required=True)
+    plan = runtime_commands.add_parser("plan", help="produce a dry-run typed RuntimePlan")
+    plan.add_argument("--profile", choices=sorted(MODEL_PROFILES))
+    plan.add_argument("--model", dest="model_id")
+    plan.add_argument("--revision", dest="model_revision")
+    plan.add_argument("--device", choices=[policy.value for policy in DevicePolicy])
+    plan.add_argument("--engine", choices=[engine.value for engine in RuntimeEngine])
+    plan.add_argument("--dtype")
+    plan.add_argument("--quantization", choices=["int8", "int4"])
+    plan.add_argument("--attention-backend")
+    plan.add_argument("--memory-headroom-fraction", type=float)
+    plan.add_argument("--model-memory-gib", type=float)
+    plan.add_argument("--allow-cpu-offload", action="store_true", default=None)
+    plan.add_argument("--allow-disk-offload", action="store_true", default=None)
+    plan.add_argument("--remote-endpoint")
+    plan_inventory = plan.add_mutually_exclusive_group()
+    plan_inventory.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly inspect CUDA; omit for safe CPU/environment discovery",
+    )
+    plan_inventory.add_argument(
+        "--fixture",
+        choices=[
+            "cpu",
+            "local-5060ti-8gb",
+            "local-5060ti-16gb",
+            "2x24gb",
+            "4x80gb",
+        ],
+        help="plan against a named fake inventory",
+    )
+
+    worker = subparsers.add_parser("model-worker", help="serve or inspect a remote model worker")
+    worker_commands = worker.add_subparsers(dest="worker_command", required=True)
+    worker_serve = worker_commands.add_parser("serve", help="serve authenticated model inference")
+    worker_serve.add_argument("--host")
+    worker_serve.add_argument("--port", type=int)
+    worker_serve.add_argument("--backend", choices=[kind.value for kind in BackendKind])
+    worker_serve.add_argument("--profile", choices=sorted(MODEL_PROFILES))
+    worker_serve.add_argument("--model", dest="model_id")
+    worker_serve.add_argument("--revision", dest="model_revision")
+    worker_serve.add_argument("--device", choices=[policy.value for policy in DevicePolicy])
+    worker_serve.add_argument("--engine", choices=[engine.value for engine in RuntimeEngine])
+    worker_serve.add_argument("--dtype")
+    worker_serve.add_argument("--quantization", choices=["int8", "int4"])
+    worker_serve.add_argument("--attention-backend")
+    worker_serve.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly inspect visible CUDA devices before starting the worker",
+    )
+    worker_serve.add_argument(
+        "--auth-token-env",
+        default="OASIS_MODEL_WORKER_AUTH_TOKEN",
+        help="environment variable containing the bearer token",
+    )
+    for name in ("health", "capabilities"):
+        command = worker_commands.add_parser(name, help=f"read worker {name}")
+        command.add_argument("--endpoint", required=True)
+        command.add_argument(
+            "--auth-token-env",
+            default="OASIS_REMOTE_AUTH_TOKEN",
+            help="environment variable containing the bearer token",
+        )
+
+    evaluate = subparsers.add_parser("evaluate", help="run or resume a benchmark manifest")
+    evaluate.add_argument("manifest", type=Path)
+    evaluate.add_argument("--output", type=Path, default=Path("evaluation-output"))
+    evaluate.add_argument(
+        "--confirm-real-model-evaluation",
+        action="store_true",
+        help="required explicit approval for a manifest that loads real model weights",
+    )
+    evaluate.add_argument(
+        "--probe-cuda",
+        action="store_true",
+        help="explicitly inspect visible CUDA for an approved real-model evaluation",
+    )
+
+    summarize = subparsers.add_parser("summarize", help="summarize benchmark raw results")
+    summarize.add_argument("results", type=Path)
+
+    showcase_help = "run or resume the complete offline Track B showcase release"
+    showcase = subparsers.add_parser("demo", help=showcase_help, description=showcase_help)
+    showcase.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evaluation-output/track-b-showcase-v1"),
+    )
     return parser
 
 
 def _settings_from_args(args: argparse.Namespace) -> OasisSettings:
     cli_values = {
-        "backend": args.backend,
-        "model_profile": args.profile,
-        "model_id": args.model_id,
-        "model_revision": args.model_revision,
-        "device": args.device,
-        "dtype": args.dtype,
-        "max_generated_tokens": args.max_generated_tokens,
-        "thinking": args.thinking,
-        "trust_remote_code": args.trust_remote_code,
+        "backend": getattr(args, "backend", None),
+        "model_profile": getattr(args, "profile", None),
+        "model_id": getattr(args, "model_id", None),
+        "model_revision": getattr(args, "model_revision", None),
+        "device": getattr(args, "device", None),
+        "runtime_engine": getattr(args, "engine", None),
+        "dtype": getattr(args, "dtype", None),
+        "quantization": getattr(args, "quantization", None),
+        "attention_backend": getattr(args, "attention_backend", None),
+        "max_generated_tokens": getattr(args, "max_generated_tokens", None),
+        "thinking": getattr(args, "thinking", None),
+        "trust_remote_code": getattr(args, "trust_remote_code", None),
+        "remote_endpoint": getattr(args, "remote_endpoint", None),
     }
     return OasisSettings.resolve(cli_overrides=cli_values)
 
 
-def _make_backend(settings: OasisSettings) -> ModelBackend:
-    profile = resolve_model_profile(settings.model_profile, settings.model_id)
-    if settings.backend is BackendKind.FAKE:
-        return FakeModelBackend(profile=profile)
-    return TransformersModelBackend(
-        profile_name=settings.model_profile,
-        model_id=settings.model_id,
-        revision=settings.model_revision,
-        device=settings.device,
-        dtype=settings.dtype,
-        trust_remote_code=settings.trust_remote_code,
-    )
+def _make_backend(
+    settings: OasisSettings,
+    *,
+    probe_cuda: bool = False,
+) -> ModelBackend:
+    inventory = inspect_cuda_inventory() if probe_cuda else None
+    return create_model_backend(settings, inventory=inventory)
 
 
 async def _send_turn(
@@ -189,7 +364,7 @@ async def _send_turn(
 
 async def _chat(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
-    backend = _make_backend(settings)
+    backend = _make_backend(settings, probe_cuda=args.probe_cuda)
     history: list[ChatMessage] = []
     total_usage = TokenUsage()
     try:
@@ -275,10 +450,209 @@ async def _evidence(args: argparse.Namespace) -> int:
 
 async def _decision(args: argparse.Namespace) -> int:
     if args.decision_command == "demo":
-        result = await run_decision_demo(args.artifact_root)
-        print(result.model_dump_json(indent=2))
+        decision_result = await run_decision_demo(args.artifact_root)
+        print(decision_result.model_dump_json(indent=2))
+        return 0
+    if args.decision_command == "mobile-demo":
+        routing_result = await run_routing_demo(args.artifact_root)
+        print(routing_result.model_dump_json(indent=2))
+        return 0
+    if args.decision_command == "anytime-demo":
+        from oasis.controller import BudgetSpec
+
+        anytime_result = await run_anytime_demo(
+            args.artifact_root,
+            budget=BudgetSpec(
+                wall_time_ms=args.wall_time_ms,
+                max_total_model_tokens=args.max_total_model_tokens,
+                max_generated_tokens=args.max_generated_tokens,
+                max_tool_calls=args.max_tool_calls,
+            ),
+        )
+        print(anytime_result.model_dump_json(indent=2))
         return 0
     raise ValueError(f"unknown decision command: {args.decision_command}")
+
+
+def _serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from oasis.api import create_app
+
+    settings = OasisSettings.resolve(
+        cli_overrides={
+            "backend": args.backend,
+            "model_profile": args.profile,
+            "model_id": args.model_id,
+            "model_revision": args.model_revision,
+            "device": args.device,
+            "runtime_engine": args.engine,
+            "dtype": args.dtype,
+            "quantization": args.quantization,
+            "attention_backend": args.attention_backend,
+            "remote_endpoint": args.remote_endpoint,
+            "artifact_root": args.artifact_root,
+            "run_root": args.run_root,
+            "api_host": args.host,
+            "api_port": args.port,
+            "api_max_concurrent_runs": args.max_concurrent_runs,
+            "api_max_request_bytes": args.max_request_bytes,
+            "api_max_artifact_response_bytes": args.max_artifact_response_bytes,
+            "serve_ui": args.serve_ui,
+            "ui_root": args.ui_root,
+        }
+    )
+    inventory = inspect_cuda_inventory() if args.probe_cuda else None
+    uvicorn.run(
+        create_app(settings, compute_inventory=inventory),
+        host=settings.api_host,
+        port=settings.api_port,
+    )
+    return 0
+
+
+def _inventory_from_args(args: argparse.Namespace) -> ComputeInventory:
+    if getattr(args, "fixture", None):
+        return named_fake_inventory(args.fixture)
+    if getattr(args, "probe_cuda", False):
+        return inspect_cuda_inventory()
+    return safe_cpu_inventory()
+
+
+def _hardware(args: argparse.Namespace) -> int:
+    if args.hardware_command != "inspect":
+        raise ValueError(f"unknown hardware command: {args.hardware_command}")
+    inventory = _inventory_from_args(args)
+    print(inventory.model_dump_json(indent=2))
+    return 0
+
+
+def _runtime(args: argparse.Namespace) -> int:
+    if args.runtime_command != "plan":
+        raise ValueError(f"unknown runtime command: {args.runtime_command}")
+    model_memory_bytes = (
+        round(args.model_memory_gib * 1024**3) if args.model_memory_gib is not None else None
+    )
+    settings = OasisSettings.resolve(
+        cli_overrides={
+            "model_profile": args.profile,
+            "model_id": args.model_id,
+            "model_revision": args.model_revision,
+            "device": args.device,
+            "runtime_engine": args.engine,
+            "dtype": args.dtype,
+            "quantization": args.quantization,
+            "attention_backend": args.attention_backend,
+            "memory_headroom_fraction": args.memory_headroom_fraction,
+            "model_memory_bytes": model_memory_bytes,
+            "allow_cpu_offload": args.allow_cpu_offload,
+            "allow_disk_offload": args.allow_disk_offload,
+            "remote_endpoint": args.remote_endpoint,
+        }
+    )
+    profile = resolve_model_profile(settings.model_profile, settings.model_id)
+    inventory = _inventory_from_args(args)
+    resolved = ConservativeRuntimePlanner().plan(
+        profile,
+        inventory,
+        settings.runtime_config(),
+        revision=settings.model_revision,
+    )
+    print(
+        json.dumps(
+            {
+                "dry_run": not args.probe_cuda,
+                "inventory": inventory.sanitized().model_dump(mode="json"),
+                "plan": resolved.model_dump(mode="json"),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _worker_token(variable: str) -> str:
+    token = os.environ.get(variable)
+    if not token:
+        raise ValueError(f"model-worker authentication requires environment variable {variable}")
+    return token
+
+
+async def _worker_client(args: argparse.Namespace) -> int:
+    token = _worker_token(args.auth_token_env)
+    runtime = RemoteModelRuntime(args.endpoint, auth_token=token)
+    try:
+        result = (
+            await runtime.health()
+            if args.worker_command == "health"
+            else await runtime.capability_report()
+        )
+        print(result.model_dump_json(indent=2))
+        return 0
+    finally:
+        await runtime.close()
+
+
+async def _evaluate(args: argparse.Namespace) -> int:
+    from oasis.evaluation import load_manifest, run_benchmark
+
+    manifest = load_manifest(args.manifest)
+    if args.probe_cuda and not args.confirm_real_model_evaluation:
+        raise ValueError("--probe-cuda requires --confirm-real-model-evaluation")
+    if args.probe_cuda and manifest.model.backend != "transformers":
+        raise ValueError("--probe-cuda applies only to a real-model evaluation manifest")
+    inventory = inspect_cuda_inventory() if args.probe_cuda else safe_cpu_inventory()
+    summary = await run_benchmark(
+        manifest,
+        args.output,
+        allow_real_model=args.confirm_real_model_evaluation,
+        compute_inventory=inventory,
+    )
+    print(summary.model_dump_json(indent=2))
+    return 0
+
+
+def _summarize(args: argparse.Namespace) -> int:
+    from oasis.evaluation import summarize_results
+
+    print(summarize_results(args.results).model_dump_json(indent=2))
+    return 0
+
+
+async def _showcase(args: argparse.Namespace) -> int:
+    from oasis.showcase import run_showcase
+
+    report = await run_showcase(args.output)
+    print(report.model_dump_json(indent=2))
+    return 0
+
+
+def _worker_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from oasis.model_worker import create_model_worker_app
+
+    settings = OasisSettings.resolve(
+        cli_overrides={
+            "backend": args.backend,
+            "model_profile": args.profile,
+            "model_id": args.model_id,
+            "model_revision": args.model_revision,
+            "device": args.device,
+            "runtime_engine": args.engine,
+            "dtype": args.dtype,
+            "quantization": args.quantization,
+            "attention_backend": args.attention_backend,
+            "api_host": args.host,
+            "api_port": args.port,
+        }
+    )
+    inventory = inspect_cuda_inventory() if args.probe_cuda else safe_cpu_inventory()
+    backend = create_model_backend(settings, inventory=inventory)
+    token = _worker_token(args.auth_token_env)
+    app = create_model_worker_app(backend, auth_token=token)
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port)
+    return 0
 
 
 def _route_coordinates(values: Sequence[str]) -> tuple[tuple[float, float], ...]:
@@ -415,9 +789,27 @@ def _run(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_evidence(args))
         if args.command == "decision":
             return asyncio.run(_decision(args))
-    except (ModelBackendError, ToolRegistryError, ValueError) as error:
+        if args.command == "serve":
+            return _serve(args)
+        if args.command == "hardware":
+            return _hardware(args)
+        if args.command == "runtime":
+            return _runtime(args)
+        if args.command == "model-worker":
+            if args.worker_command == "serve":
+                return _worker_serve(args)
+            return asyncio.run(_worker_client(args))
+        if args.command == "evaluate":
+            return asyncio.run(_evaluate(args))
+        if args.command == "summarize":
+            return _summarize(args)
+        if args.command == "demo":
+            return asyncio.run(_showcase(args))
+    except (ModelBackendError, RuntimePlanningError, ToolRegistryError, ValueError) as error:
         if isinstance(error, ModelBackendError):
             print(f"error[{error.detail.code}]: {error.detail.message}", file=sys.stderr)
+        elif isinstance(error, RuntimePlanningError):
+            print(error.rejection.model_dump_json(), file=sys.stderr)
         else:
             print(f"error: {error}", file=sys.stderr)
         return 2

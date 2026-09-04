@@ -50,13 +50,27 @@ class EquityGroup(BaseModel):
 
 
 class ServiceScenario(BaseModel):
-    """One immutable demand-by-candidate service matrix and its expected-value weight."""
+    """One immutable location scenario and its expected-value weight.
+
+    The service matrix remains required for backwards compatibility and coverage objectives.
+    Optional access, demand-multiplier, and failed-site data let the same wrapper drive access and
+    resilience analysis without changing the underlying location problem family.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     name: str = Field(min_length=1, pattern=r"^[A-Za-z][A-Za-z0-9_.:-]*$")
     service_matrix: ArtifactRef
+    access_matrix: ArtifactRef | None = None
+    demand_multiplier: ArtifactRef | None = None
+    failed_site_ids: tuple[str, ...] = ()
     weight: float = Field(default=1.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def failed_sites_are_unique(self) -> Self:
+        if len(self.failed_site_ids) != len(set(self.failed_site_ids)):
+            raise ValueError("failed site IDs must be unique within a scenario")
+        return self
 
 
 class LocationAllocationPolicy(BaseModel):
@@ -89,7 +103,7 @@ class LocationAllocationProblem(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: str = "1.0.0"
+    schema_version: str = "1.1.0"
     type_id: LocationProblemType
     plugin_version: str = "1.0.0"
     evaluator_version: str = "1.0.0"
@@ -112,6 +126,86 @@ class LocationAllocationProblem(BaseModel):
             raise ValueError("service scenario names must be unique")
         if len(group_names) != len(set(group_names)):
             raise ValueError("equity group names must be unique")
+        return self
+
+
+class RouteProblemType(StrEnum):
+    """Route-service families supported by the shared problem registry."""
+
+    TSP = "tsp"
+    ORIENTEERING = "orienteering"
+    MOBILE_SERVICE = "mobile_service_route"
+
+
+class RouteScenario(BaseModel):
+    """One directed travel and demand realization for a route-service problem."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1, pattern=r"^[A-Za-z][A-Za-z0-9_.:-]*$")
+    travel_matrix: ArtifactRef
+    demand_multiplier: ArtifactRef | None = None
+    weight: float = Field(default=1.0, gt=0.0)
+    directed: bool = True
+
+
+class RouteServicePolicy(BaseModel):
+    """Locked routing resources and scenario comparator configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    depot_ids: tuple[str, ...] = Field(min_length=1)
+    vehicle_count: int = Field(default=1, ge=1)
+    shift_length: float = Field(gt=0.0)
+    time_units: str = Field(min_length=1)
+    vehicle_capacity: float | None = Field(default=None, gt=0.0)
+    capacity_units: str | None = None
+    require_return: bool = True
+    scenario_aggregation: ScenarioAggregation = ScenarioAggregation.EXPECTED
+    scenario_weights: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def valid_depots_and_weights(self) -> Self:
+        if len(self.depot_ids) != len(set(self.depot_ids)):
+            raise ValueError("depot IDs must be unique")
+        if len(self.depot_ids) not in {1, self.vehicle_count}:
+            raise ValueError("declare either one shared depot or one depot per vehicle")
+        if any(value <= 0.0 for value in self.scenario_weights.values()):
+            raise ValueError("scenario weights must be positive")
+        if (self.vehicle_capacity is None) != (self.capacity_units is None):
+            raise ValueError("vehicle capacity and its units must be declared together")
+        return self
+
+
+class RouteServiceProblem(BaseModel):
+    """Immutable directed routing problem for mobile public-health service."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0.0"
+    type_id: RouteProblemType
+    plugin_version: str = "1.0.0"
+    evaluator_version: str = "1.0.0"
+    nodes: ArtifactRef
+    node_id_field: str = Field(min_length=1)
+    prize_field: str | None = None
+    demand_field: str | None = None
+    service_time_field: str | None = None
+    window_start_field: str | None = None
+    window_end_field: str | None = None
+    travel_scenarios: tuple[RouteScenario, ...] = Field(min_length=1)
+    policy: RouteServicePolicy
+    evidence_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    problem_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def scenario_names_are_unique(self) -> Self:
+        names = tuple(scenario.name for scenario in self.travel_scenarios)
+        if len(names) != len(set(names)):
+            raise ValueError("route scenario names must be unique")
+        if (self.window_start_field is None) != (self.window_end_field is None):
+            raise ValueError("route time-window start and end fields must be declared together")
         return self
 
 
@@ -189,6 +283,10 @@ class SearchStrategy(StrEnum):
     SCENARIO_AWARE = "scenario_aware"
     EXACT_ENUMERATION = "exact_enumeration"
     ORTOOLS_CP_SAT = "ortools_cp_sat"
+    TWO_OPT = "two_opt"
+    RELOCATE = "relocate"
+    SWAP = "swap"
+    ORTOOLS_ROUTING = "ortools_routing"
 
 
 class SearchResumeToken(BaseModel):
@@ -221,9 +319,11 @@ class ResultView(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    schema_version: str = "1.1.0"
     problem_type: str
     feasible: bool
     selected_site_ids: tuple[str, ...]
+    route_count: int = Field(default=0, ge=0)
     primary_metric_name: str | None = None
     primary_metric_value: float | None = None
     overall_metrics: dict[str, float] = Field(default_factory=dict)
