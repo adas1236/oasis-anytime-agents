@@ -153,6 +153,82 @@ local fake transport, not claimed as a measured provider deployment. The authori
 scope in `HARDWARE_CHANGES.md` excludes multi-node, SLURM-specific, container, DeepSpeed, vLLM,
 and torchrun implementation.
 
+## Mock dataset experiments
+
+The three JSON files in `data/` can be exercised through one runner. The dataset selection
+determines the problem family; records do not need a separate problem-type field. Location tools
+accept the plaintext names found in each prompt, while the runner creates normalized IDs only for
+internal lookup. Angles are interpreted as degrees and distances as kilometers.
+
+Run a small, offline infrastructure smoke test first. `fake` drives the same model/tool loop with a
+scripted solver call and loads no model weights:
+
+```bash
+uv run --no-sync python src/oasis/run_mock_experiment.py \
+  --model-type fake \
+  --gpus none \
+  --dataset max_coverage \
+  --limit 10
+```
+
+Run a real local model on selected GPUs by changing the model type and profile (or pass a custom
+Hugging Face ID with `--model`):
+
+```bash
+uv run --no-sync python src/oasis/run_mock_experiment.py \
+  --model-type transformers \
+  --profile gemma4_e2b_it \
+  --gpus 0,1 \
+  --dataset minimum_facility \
+  --time-budgets 10s,60s,unlimited \
+  --token-budgets 2k,8k,unlimited \
+  --limit 100 \
+  --output evaluation-output/minimum-facility.jsonl
+```
+
+Those two lists form a Cartesian grid: the example runs nine budget cells for each selected
+record. A token budget is the aggregate input plus generated token count across every model turn
+for that cell; reasoning tokens are reported separately but are already part of generated tokens.
+`unlimited` may be used independently for either dimension, and the default is unlimited for both.
+`--max-generated-tokens` remains a per-generation cap rather than an anytime budget. The optional
+`--max-tool-calls` and `--model-call-timeout-seconds` safety limits also default to unlimited.
+
+Every cell begins with a cheap feasible baseline. Baseline construction, model loading, and the
+shared static OSRM matrix load are recorded as setup rather than charged to the cell budget. With a
+zero time or token budget, the result is therefore the baseline. The current mock solver is exact,
+so the observable incumbent path is usually baseline-to-optimum rather than a gradual optimization
+curve; `incumbent_timeline`, `terminal_reason`, `requested_budget`, and `consumed_budget` make that
+explicit in each JSONL record.
+
+The default `--gpus auto` mode preserves `CUDA_VISIBLE_DEVICES` and lets the Python runtime inspect
+however many devices the scheduler exposed. Pass an explicit device list only when running outside
+a scheduler and intentionally restricting visibility; use `--gpus none` for CPU-only execution.
+Transformer experiments default to `bfloat16` and SDPA; override `--dtype` when targeting hardware
+that does not support bfloat16.
+
+For `tsp`, the runner uses the coordinates already stored in JSON and requests OSRM driving
+distance tables; it does not geocode the names again. Because each geographic region has only ten
+unique locations, it requests and caches one regional table rather than making one request per
+example. Later runs can prohibit network fallback with `--osrm-cache-only`:
+
+```bash
+uv run --no-sync python src/oasis/run_mock_experiment.py \
+  --model-type transformers \
+  --profile gemma4_e2b_it \
+  --gpus 0 \
+  --dataset tsp \
+  --osrm-cache data/cache/osrm
+```
+
+Omit `--limit` to process the full selected dataset, use `--dataset all` for all three, and repeat
+`--region` to filter regions. The runner writes and `fsync`s one JSON object per completed
+record/budget cell. It atomically checkpoints a neighboring `*.summary.json` after every cell, with
+aggregate, per-dataset, and per-budget accuracy, errors, token use, timing, and parameters. If a job
+is interrupted, rerun the identical command with `--resume`; completed cells are skipped after the
+configuration fingerprint is verified. Use `--overwrite` instead to intentionally start over. TSP
+scores use a one-kilometer tolerance by default because the stored answers are integer distances
+and the public routing graph can change; adjust it with `--tsp-tolerance-km`.
+
 ## Deterministic fake chat
 
 Use the fake backend for a complete offline multi-turn smoke test:

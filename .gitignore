@@ -13,6 +13,7 @@ env/
 .env
 .env.*
 !.env.example
+/secrets.env
 
 # uv and package build output
 .uv-cache/
@@ -67,3 +68,6 @@ evaluations/output/
 node_modules/
 ui/dist/
 ui/build/
+
+# Machine- and scheduler-specific local scripts
+/scripts/
