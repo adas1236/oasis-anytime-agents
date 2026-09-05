@@ -59,7 +59,8 @@ hf-cache/
 .oasis/
 data/generated/
 data/cache/
-artifacts/
+# Only ignore root output; src/oasis/artifacts contains source code.
+/artifacts/
 runs/
 run-output/
 evaluation-output/
