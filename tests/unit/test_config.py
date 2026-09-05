@@ -38,6 +38,16 @@ def test_none_cli_values_do_not_mask_environment(monkeypatch: pytest.MonkeyPatch
     assert settings.model_profile == "gemma4_e2b_it"
 
 
+def test_explicit_none_clears_optional_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OASIS_QUANTIZATION", "none")
+
+    settings = OasisSettings.resolve(explicit_overrides={"quantization": None})
+
+    assert settings.quantization is None
+
+
 def test_cpu_default_wins_without_calling_mocked_cuda_probe() -> None:
     probed = False
 

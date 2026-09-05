@@ -120,9 +120,14 @@ class OasisSettings(BaseSettings):
         """Resolve defaults < environment < CLI < explicit object overrides."""
 
         values: dict[str, Any] = {}
-        for source in (cli_overrides, explicit_overrides):
-            if source:
-                values.update({key: value for key, value in source.items() if value is not None})
+        if cli_overrides:
+            # Unset argparse values defer to environment variables.
+            values.update({key: value for key, value in cli_overrides.items() if value is not None})
+        if explicit_overrides:
+            # Explicit object configuration has the highest precedence. Preserve
+            # None so callers can deliberately clear an optional environment
+            # setting (for example OASIS_QUANTIZATION=none -> quantization=None).
+            values.update(explicit_overrides)
         return cls(**values)
 
     def runtime_config(self) -> RuntimeConfig:
