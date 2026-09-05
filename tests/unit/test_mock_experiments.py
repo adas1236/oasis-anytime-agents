@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from oasis.config import OasisSettings
 from oasis.mock_experiments import (
     BudgetPoint,
     DatasetKind,
@@ -12,10 +13,12 @@ from oasis.mock_experiments import (
     Location,
     LocationIndex,
     OsrmMatrixStore,
+    _build_region_catalog,
     _fake_backend,
     _run_agent_case,
     _score,
     _select_cases,
+    _transformers_backend,
     _validated_config,
     build_parser,
     load_dataset,
@@ -246,3 +249,60 @@ async def test_tsp_solver_uses_directed_driving_matrix(tmp_path: Path) -> None:
 
     assert result["distance_km"] == 3
     assert result["route"] == ["Depot", "Clinic", "Shelter", "Depot"]
+
+
+@pytest.mark.asyncio
+async def test_tracked_osrm_matrices_reproduce_all_tsp_oracles() -> None:
+    cases = load_dataset(DatasetKind.TSP, DATA_ROOT / "tsp.json")
+    store = OsrmMatrixStore(
+        endpoint="https://router.project-osrm.org",
+        cache_dir=DATA_ROOT.parent / "infra" / "runpod" / "osrm-cache",
+        cache_only=True,
+        timeout_seconds=1,
+        region_locations=_build_region_catalog(cases),
+    )
+
+    for case in cases:
+        result = await store.solve(case.region, case.locations)
+        assert result["rounded_distance_km"] == case.answer
+
+
+@pytest.mark.asyncio
+async def test_transformer_settings_clear_unquantized_runpod_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oasis.llm.factory as factory_module
+    import oasis.runtimes as runtimes_module
+
+    config = _config(tmp_path)
+    config.model_type = "transformers"
+    config.gpus = "auto"
+    config.dtype = "bfloat16"
+    config.quantization = "none"
+    config.attention_backend = "sdpa"
+    captured: dict[str, object] = {}
+
+    class Backend:
+        async def load(self) -> None:
+            captured["loaded"] = True
+
+    def create_backend(settings: object, *, inventory: object) -> Backend:
+        captured["settings"] = settings
+        captured["inventory"] = inventory
+        return Backend()
+
+    inventory = object()
+    monkeypatch.setenv("OASIS_QUANTIZATION", "none")
+    monkeypatch.setattr(factory_module, "create_model_backend", create_backend)
+    monkeypatch.setattr(runtimes_module, "inspect_cuda_inventory", lambda: inventory)
+
+    backend = await _transformers_backend(config)
+
+    settings = captured["settings"]
+    assert backend is not None
+    assert captured["loaded"] is True
+    assert captured["inventory"] is inventory
+    assert isinstance(settings, OasisSettings)
+    assert settings.quantization is None
+    assert settings.dtype == "bfloat16"
+    assert settings.attention_backend == "sdpa"

@@ -13,6 +13,7 @@ from oasis.runpod_experiments import (
     cost_report,
     launch_plan,
     load_plan,
+    main,
     stop_pods,
     worker_main,
 )
@@ -100,6 +101,10 @@ def test_plan_shards_without_changing_selected_rows_and_overrides_gpus(
     assert all(job["pod_payload"]["gpu"]["count"] == 4 for job in plan["jobs"])
     assert all(job["pod_payload"]["gpu"]["id"] == "NVIDIA RTX A6000" for job in plan["jobs"])
     assert all(job["pod_payload"]["env"]["OASIS_EXPECTED_GPU_COUNT"] == "4" for job in plan["jobs"])
+    assert all(
+        job["pod_payload"]["env"]["OASIS_HOLD_AFTER_COMPLETION"] == "1"
+        for job in plan["jobs"]
+    )
 
 
 def test_plan_uses_runpod_v2_payload_and_requires_one_gpu_type(tmp_path: Path) -> None:
@@ -413,6 +418,23 @@ def test_probe_worker_records_hardware_without_starting_evaluator(
     assert "oasis_worker_finished" in capsys.readouterr().out
 
 
+def test_worker_entrypoint_surfaces_setup_crashes_without_restart_loop(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail_worker() -> int:
+        raise RuntimeError("test setup failure")
+
+    monkeypatch.setattr(runpod_module, "worker_main", fail_worker)
+    monkeypatch.setenv("OASIS_HOLD_AFTER_COMPLETION", "0")
+
+    assert main(["worker"]) == 1
+    event = json.loads(capsys.readouterr().err)
+    assert event["event"] == "oasis_worker_crashed"
+    assert event["error_type"] == "RuntimeError"
+    assert event["error"] == "test setup failure"
+    assert "fail_worker" in event["traceback_tail"]
+
+
 def test_worker_arguments_include_selection_guard_and_auto_gpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -433,6 +455,7 @@ def test_worker_arguments_include_selection_guard_and_auto_gpus(
         "OASIS_LIMIT": "20",
         "OASIS_SEED": "42",
         "OASIS_SELECTION_DIGEST": "a" * 64,
+        "OASIS_OSRM_CACHE": "/opt/oasis/osrm-cache",
         "OASIS_OSRM_ENDPOINT": "https://router.project-osrm.org",
         "OASIS_TSP_TOLERANCE_KM": "1.0",
         "OASIS_THINKING": "1",
@@ -445,3 +468,57 @@ def test_worker_arguments_include_selection_guard_and_auto_gpus(
     assert arguments[arguments.index("--gpus") + 1] == "auto"
     assert arguments[arguments.index("--expected-selection-digest") + 1] == "a" * 64
     assert arguments[arguments.index("--limit") + 1] == "20"
+
+
+def test_evaluation_worker_runs_subprocess_and_reports_durable_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = build_plan(
+        _write_config(tmp_path),
+        PlanOverrides(
+            rows=1,
+            time_budgets="unlimited",
+            token_budgets="unlimited",
+            gpu_count=1,
+            model_type="fake",
+        ),
+    )
+    environment = dict(plan["jobs"][0]["pod_payload"]["env"])
+    environment.update(
+        {
+            "OASIS_EXPECTED_GPU_COUNT": "0",
+            "OASIS_RESULTS_ROOT": str(tmp_path / "results"),
+            "OASIS_RESULTS_S3_URI": "",
+            "OASIS_OSRM_CACHE": str(DATA_ROOT.parent / "infra" / "runpod" / "osrm-cache"),
+            "OASIS_OSRM_CACHE_ONLY": "1",
+            "OASIS_HOLD_AFTER_COMPLETION": "0",
+        }
+    )
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        runpod_module,
+        "_gpu_inventory",
+        lambda: {
+            "pod_id": None,
+            "torch_version": "local-test",
+            "cuda_runtime": None,
+            "cuda_visible_devices": None,
+            "devices": [],
+        },
+    )
+
+    assert worker_main() == 0
+
+    local_dir = (
+        tmp_path / "results" / plan["plan_id"] / plan["jobs"][0]["job_id"]
+    )
+    status = json.loads((local_dir / "job-status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "complete"
+    assert status["runner_exit_code"] == 0
+    assert status["evaluation_summary"]["selected_records"] == 1
+    assert status["evaluation_summary"]["completed_cells"] == 1
+    assert status["evaluation_summary"]["errors"] == 0
+    events = capsys.readouterr().out
+    assert "oasis_worker_finished" in events
+    assert '"completed_cells": 1' in events

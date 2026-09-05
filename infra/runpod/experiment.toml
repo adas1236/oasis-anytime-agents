@@ -27,12 +27,15 @@ max_tool_calls = "unlimited"
 model_call_timeout = "unlimited"
 tsp_tolerance_km = 1.0
 osrm_endpoint = "https://router.project-osrm.org"
-osrm_cache_only = false
+osrm_cache = "/opt/oasis/osrm-cache"
+# The five regional matrices used by data/tsp.json are baked into the image.
+# Keep remote jobs deterministic and independent of the public OSRM service.
+osrm_cache_only = true
 
 [runpod]
 # Build and push this exact image name before launching. Make the GHCR package
 # public, or set container_registry_auth_id below for a private package.
-image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v2"
+image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4"
 
 # Use exactly one GPU type for controlled timing comparisons. Multiple entries
 # mean acceptable alternatives chosen for availability, not heterogeneous GPUs.

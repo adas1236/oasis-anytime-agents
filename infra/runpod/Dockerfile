@@ -41,6 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY src ./src
 COPY data ./data
+COPY infra/runpod/osrm-cache ./osrm-cache
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_CACHE_DIR=/root/.cache/uv uv pip install \
       --python "${VIRTUAL_ENV}/bin/python" \
@@ -50,6 +51,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Catch base-image drift and missing runtime dependencies during the GitHub
 # build, before a paid Pod is allocated. GPU availability is checked by the
 # worker after Runpod starts the container.
-RUN python -c "import boto3, geopandas, ortools, rasterio, torch, transformers; assert torch.__version__.startswith('2.8.'), torch.__version__; print({'torch': torch.__version__, 'cuda': torch.version.cuda, 'transformers': transformers.__version__})"
+RUN python -c "import boto3, geopandas, ortools, rasterio, torch, torchvision, transformers; from transformers import AutoModelForMultimodalLM, Gemma4Config, Gemma4Processor; assert torch.__version__.startswith('2.8.'), torch.__version__; assert torchvision.__version__.startswith('0.23.'), torchvision.__version__; assert AutoModelForMultimodalLM._model_mapping[Gemma4Config].__name__ == 'Gemma4ForConditionalGeneration'; print({'torch': torch.__version__, 'torchvision': torchvision.__version__, 'cuda': torch.version.cuda, 'transformers': transformers.__version__, 'gemma4_processor': Gemma4Processor.__name__})"
 
 CMD ["python", "-m", "oasis.runpod_experiments", "worker"]

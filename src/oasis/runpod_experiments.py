@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import tomllib
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -203,9 +204,14 @@ def _job_environment(
         "OASIS_MAX_TOOL_CALLS": str(experiment["max_tool_calls"]),
         "OASIS_MODEL_CALL_TIMEOUT": str(experiment["model_call_timeout"]),
         "OASIS_OSRM_CACHE_ONLY": "1" if experiment["osrm_cache_only"] else "0",
+        "OASIS_OSRM_CACHE": str(experiment["osrm_cache"]),
         "OASIS_OSRM_ENDPOINT": str(experiment["osrm_endpoint"]),
         "OASIS_TSP_TOLERANCE_KM": str(experiment["tsp_tolerance_km"]),
         "OASIS_EXPECTED_GPU_COUNT": str(gpu_count),
+        # Runpod keeps a Pod in its desired RUNNING state by restarting a
+        # container that exits. Hold after final persistence so a monitor can
+        # stop the Pod without rerunning the evaluation.
+        "OASIS_HOLD_AFTER_COMPLETION": "1",
         "OASIS_RESULTS_ROOT": str(artifacts["local_root"]),
         "OASIS_RESULTS_S3_URI": str(artifacts["s3_uri"]),
         "OASIS_UPLOAD_INTERVAL_SECONDS": str(artifacts["upload_interval_seconds"]),
@@ -355,6 +361,7 @@ def build_plan(config_path: Path, overrides: PlanOverrides | None = None) -> dic
         "max_tool_calls": str(experiment_raw.get("max_tool_calls", "unlimited")),
         "model_call_timeout": str(experiment_raw.get("model_call_timeout", "unlimited")),
         "osrm_cache_only": bool(experiment_raw.get("osrm_cache_only", False)),
+        "osrm_cache": str(experiment_raw.get("osrm_cache", "/opt/oasis/osrm-cache")),
         "osrm_endpoint": str(
             experiment_raw.get("osrm_endpoint", "https://router.project-osrm.org")
         ),
@@ -940,7 +947,7 @@ def _runner_arguments(output: Path) -> list[str]:
         "--osrm-endpoint",
         _required_env("OASIS_OSRM_ENDPOINT"),
         "--osrm-cache",
-        "/workspace/cache/osrm",
+        _required_env("OASIS_OSRM_CACHE"),
         "--tsp-tolerance-km",
         _required_env("OASIS_TSP_TOLERANCE_KM"),
         "--output",
@@ -1048,6 +1055,34 @@ def _read_log_tail(path: Path, *, max_bytes: int = 16_384) -> str:
         return f"Could not read {path.name}: {type(exc).__name__}: {exc}"
 
 
+def _evaluation_summary(path: Path) -> dict[str, Any] | None:
+    """Read the durable evaluator summary used to validate a successful exit."""
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _hold_for_controller() -> None:
+    """Keep a finished Runpod container alive until the external monitor stops it."""
+
+    if os.environ.get("OASIS_HOLD_AFTER_COMPLETION", "0").strip() != "1":
+        return
+    print(
+        json.dumps(
+            {
+                "event": "oasis_worker_awaiting_stop",
+                "pod_id": os.environ.get("RUNPOD_POD_ID"),
+            }
+        ),
+        flush=True,
+    )
+    while True:
+        signal.pause()
+
+
 def worker_main() -> int:
     """Run one planned condition inside a Pod and continuously persist artifacts."""
 
@@ -1125,6 +1160,20 @@ def worker_main() -> int:
             status["artifact_upload_error"] = probe_upload_error
             _write_json(status_path, status)
             print(f"Final artifact upload failed: {probe_upload_error}", file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "event": "oasis_worker_finished",
+                        "mode": mode,
+                        "plan_id": plan_id,
+                        "job_id": job_id,
+                        "status": status["status"],
+                        "elapsed_seconds": status["worker_elapsed_seconds"],
+                    }
+                ),
+                flush=True,
+            )
+            _hold_for_controller()
             return 3
         print(
             json.dumps(
@@ -1139,6 +1188,7 @@ def worker_main() -> int:
             ),
             flush=True,
         )
+        _hold_for_controller()
         return 0
 
     arguments = _runner_arguments(output)
@@ -1176,6 +1226,31 @@ def worker_main() -> int:
         if uploader.is_alive():
             uploader.join(timeout=5)
         finished_at = datetime.now(UTC)
+        summary_path = output.with_suffix(".summary.json")
+        evaluation_summary = _evaluation_summary(summary_path)
+        if return_code == 0 and (
+            evaluation_summary is None or evaluation_summary.get("status") != "complete"
+        ):
+            return_code = 4
+        summary_metrics = (
+            {
+                key: evaluation_summary.get(key)
+                for key in (
+                    "selected_records",
+                    "planned_cells",
+                    "completed_cells",
+                    "remaining_cells",
+                    "correct",
+                    "accuracy",
+                    "errors",
+                    "mean_input_tokens",
+                    "mean_output_tokens",
+                    "elapsed_seconds",
+                )
+            }
+            if evaluation_summary is not None
+            else None
+        )
         status = {
             "status": "complete" if return_code == 0 else "failed",
             **common_status,
@@ -1184,6 +1259,8 @@ def worker_main() -> int:
             "worker_elapsed_seconds": (finished_at - container_started_at).total_seconds(),
             "runner_exit_code": return_code,
         }
+        if summary_metrics is not None:
+            status["evaluation_summary"] = summary_metrics
         if return_code != 0:
             stderr_tail = _read_log_tail(stderr_path)
             status["runner_stderr_tail"] = stderr_tail
@@ -1218,10 +1295,12 @@ def worker_main() -> int:
                     "job_id": job_id,
                     "status": status["status"],
                     "elapsed_seconds": status["worker_elapsed_seconds"],
+                    "evaluation_summary": summary_metrics,
                 }
             ),
             flush=True,
         )
+    _hold_for_controller()
     return return_code if upload_error is None else 3
 
 
@@ -1288,6 +1367,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    if arguments.command == "worker":
+        try:
+            return worker_main()
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "event": "oasis_worker_crashed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback_tail": traceback.format_exc()[-16_384:],
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            _hold_for_controller()
+            return 1
     try:
         if arguments.command == "plan":
             if arguments.output.exists() and not arguments.overwrite:
@@ -1340,7 +1437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 execute=arguments.execute,
                 api_base=arguments.api_base,
             )
-        return worker_main()
+        parser.error(f"unsupported command: {arguments.command}")
     except (OSError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"error: {exc}\n")
 

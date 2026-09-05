@@ -10,24 +10,25 @@ After syncing the updated project, `oasis-runpod` is a shorthand for
 
 1. After committing and pushing these files, open the repository's **Actions**
    tab, choose **Build Runpod evaluation image**, select **Run workflow**, and
-   leave the tag as `runpod-eval-v2`. The manual workflow publishes the exact
+   leave the tag as `runpod-eval-v4`. The manual workflow publishes the exact
    image already named in `experiment.toml`; it does not need any added GitHub
    secrets. The workflow summary records the immutable image digest and manifest.
-   The existing `runpod-eval-v1` tag remains available as a fallback.
 
-   Version 2 uses Runpod's host-cached PyTorch 2.8/CUDA 12.8 base. Its custom
+   The image uses Runpod's host-cached PyTorch 2.8/CUDA 12.8 base. Its custom
    layer reuses that Torch installation, prunes Torch and torchvision from the
    exported application requirements, and keeps uv's download cache outside the
    final image. This avoids the duplicated CUDA stack that prevented the first
-   image from finishing its pull in a reasonable time.
+   image from finishing its pull in a reasonable time. The build also checks the
+   Torch/torchvision versions and the Gemma 4 Transformers auto-model mapping,
+   while the image includes the five OSRM matrices needed by the mock TSP data.
 
    If you prefer to build locally instead, use:
 
    ```bash
    docker login ghcr.io -u adas1236
    docker build --platform=linux/amd64 -f infra/runpod/Dockerfile \
-     -t ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v2 .
-   docker push ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v2
+     -t ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4 .
+   docker push ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4
    ```
 
    If the GHCR package must remain private, create a Runpod container-registry
@@ -65,10 +66,10 @@ options are:
 
    - Alternatively, set `runpod.network_volume_id`. Every job writes to a
      unique directory, so sharing results is safe. Preload the Hugging Face and
-     OSRM caches there before a large run. A network volume constrains all Pods
-     to its data center, which can reduce simultaneous GPU availability. If you
-     choose this route, set `artifacts.s3_uri = ""` and remove the three AWS
-     variables from `[runpod.env]`.
+     optional runtime caches there before a large run. A network volume
+     constrains all Pods to its data center, which can reduce simultaneous GPU
+     availability. If you choose this route, set `artifacts.s3_uri = ""` and
+     remove the three AWS variables from `[runpod.env]`.
    - With neither S3 nor a network volume, each Pod gets its own volume disk. Do not terminate
      those Pods until their result directories have been downloaded.
 
@@ -101,8 +102,10 @@ uv run --no-sync python -m oasis.runpod_experiments launch \
 The launch state records the Pod creation time and hourly price. The probe's
 `job-status.json` records container start time, worker setup time, image tag,
 Torch/CUDA versions, and GPU inventory. Together they separate image cold-start
-cost from model and evaluator cost. Stop the Pod immediately after the
-`oasis_worker_finished` log appears or the probe status reaches `complete`:
+cost from model and evaluator cost. After emitting `oasis_worker_finished`, the
+container deliberately waits instead of exiting and being restarted by Runpod.
+Stop the Pod immediately after that log appears or the probe status reaches
+`complete`:
 
 ```bash
 uv run --no-sync python -m oasis.runpod_experiments stop \
@@ -238,14 +241,19 @@ existing evaluator fsyncs every completed row and atomically rewrites its
 summary. The wrapper uploads all artifacts at the configured interval and on
 exit, restores prior S3 checkpoints on retry, verifies the visible GPU count,
 records the actual GPU/VRAM/compute capability and Torch/CUDA versions, and
-forwards termination signals to the evaluator.
+forwards termination signals to the evaluator. It treats a missing or incomplete
+result summary as a failure, includes summary metrics or a bounded error tail in
+its final log event, and waits for the lifecycle controller after every terminal
+outcome so Runpod cannot start the workload a second time.
 
 The launcher uses Runpod REST API v2 and writes every successful lifecycle
 mutation to the neighboring state file before continuing.
 
 The image intentionally runs the batch worker directly instead of chaining the
-base image's `/start.sh`: these Pods expose no SSH or Jupyter service, finish
-when the worker exits, and persist their outputs to S3 and the mounted Pod disk.
+base image's `/start.sh`: these Pods expose no SSH or Jupyter service and persist
+their outputs to S3 and the mounted Pod disk. Stop them after the terminal worker
+event to release GPU billing; the completion hold is a restart guard, not an
+automatic lifecycle controller.
 
 Official references: [Pod REST API](https://docs.runpod.io/api-reference-v2/pods/create-pod),
 [Pod CLI and GPU identifiers](https://docs.runpod.io/runpodctl/reference/runpodctl-pod),
