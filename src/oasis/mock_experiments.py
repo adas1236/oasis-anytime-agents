@@ -91,6 +91,7 @@ class ExperimentConfig:
     limit: int | None
     shuffle: bool
     seed: int
+    expected_selection_digest: str | None
     regions: tuple[str, ...]
     output: Path | None
     overwrite: bool
@@ -674,9 +675,7 @@ class OsrmMatrixStore:
 
         await self._region_matrix(region)
 
-    async def evaluate_route(
-        self, region: str, locations: Sequence[Location]
-    ) -> dict[str, Any]:
+    async def evaluate_route(self, region: str, locations: Sequence[Location]) -> dict[str, Any]:
         """Evaluate the prompt-order round trip used as the TSP baseline."""
 
         if len(locations) < 2:
@@ -714,9 +713,7 @@ def _build_region_catalog(cases: Sequence[MockCase]) -> dict[str, tuple[Location
     return {region: tuple(locations.values()) for region, locations in by_region.items()}
 
 
-async def _baseline_prediction(
-    case: MockCase, osrm: OsrmMatrixStore | None
-) -> dict[str, Any]:
+async def _baseline_prediction(case: MockCase, osrm: OsrmMatrixStore | None) -> dict[str, Any]:
     """Return a cheap feasible plan available even when either budget is zero."""
 
     if case.dataset is DatasetKind.MAX_COVERAGE:
@@ -922,9 +919,7 @@ async def _dispatch_tool(
             raise ValueError("coverage_radius_km must be a number")
         if not math.isclose(
             float(target), case.coverage_target_percent or 0, rel_tol=0, abs_tol=1e-9
-        ) or not math.isclose(
-            float(radius), case.coverage_radius_km or 0, rel_tol=0, abs_tol=1e-9
-        ):
+        ) or not math.isclose(float(radius), case.coverage_radius_km or 0, rel_tol=0, abs_tol=1e-9):
             raise ValueError("solver parameters do not match the current problem")
         return solve_minimum_facility(locations, float(target), float(radius))
     if osrm is None:
@@ -1024,11 +1019,7 @@ async def _run_agent_case(
                 config.case_timeout_seconds,
             )
         except TimeoutError:
-            reason = (
-                "time_budget_exhausted"
-                if clock.time_exhausted
-                else "model_call_timeout"
-            )
+            reason = "time_budget_exhausted" if clock.time_exhausted else "model_call_timeout"
             return finish(reason)
 
         allowance = clock.generation_allowance(
@@ -1059,11 +1050,7 @@ async def _run_agent_case(
                 await backend.abort(request_id)
             except Exception:
                 pass
-            reason = (
-                "time_budget_exhausted"
-                if clock.time_exhausted
-                else "model_call_timeout"
-            )
+            reason = "time_budget_exhausted" if clock.time_exhausted else "model_call_timeout"
             return finish(reason)
         clock.record_turn(turn.usage)
         if (
@@ -1271,7 +1258,24 @@ def _select_cases(
     selected = selected[config.start : stop]
     if not selected:
         raise ValueError("No records matched the requested dataset slice")
+    actual_digest = selection_digest(selected)
+    if (
+        config.expected_selection_digest is not None
+        and actual_digest != config.expected_selection_digest
+    ):
+        raise ValueError(
+            "Selected records do not match --expected-selection-digest: "
+            f"expected {config.expected_selection_digest}, got {actual_digest}"
+        )
     return selected, all_loaded
+
+
+def selection_digest(cases: Sequence[MockCase] | Sequence[str]) -> str:
+    """Hash an ordered record selection for reproducible distributed evaluation."""
+
+    record_ids = [case if isinstance(case, str) else case.record_id for case in cases]
+    encoded = json.dumps(record_ids, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _output_path(config: ExperimentConfig) -> Path:
@@ -1296,9 +1300,7 @@ def _parse_time_budgets(value: str) -> tuple[float | None, ...]:
         else:
             match = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m|h)?", item)
             if match is None:
-                raise ValueError(
-                    f"invalid time budget {raw!r}; use seconds or a ms/s/m/h suffix"
-                )
+                raise ValueError(f"invalid time budget {raw!r}; use seconds or a ms/s/m/h suffix")
             parsed = float(match.group(1)) * multipliers.get(match.group(2) or "s", 1.0)
         if parsed not in budgets:
             budgets.append(parsed)
@@ -1337,8 +1339,7 @@ def _budget_grid(config: ExperimentConfig) -> tuple[BudgetPoint, ...]:
     return tuple(
         BudgetPoint(
             budget_id=(
-                f"time-{_budget_label(wall_time, time_value=True)}_"
-                f"tokens-{_budget_label(tokens)}"
+                f"time-{_budget_label(wall_time, time_value=True)}_tokens-{_budget_label(tokens)}"
             ),
             wall_time_seconds=wall_time,
             max_total_model_tokens=tokens,
@@ -1374,6 +1375,7 @@ def _config_payload(config: ExperimentConfig) -> dict[str, Any]:
         "limit": config.limit,
         "shuffle": config.shuffle,
         "seed": config.seed,
+        "expected_selection_digest": config.expected_selection_digest,
         "regions": list(config.regions),
         "osrm_endpoint": config.osrm_endpoint,
         "osrm_cache": str(config.osrm_cache),
@@ -1418,9 +1420,7 @@ def _resume_results(
         if not isinstance(result, dict):
             raise ValueError(f"JSONL record {index + 1} in {output_path} is not an object")
         if result.get("experiment_fingerprint") != expected_fingerprint:
-            raise ValueError(
-                f"Cannot resume {output_path}: its experiment configuration differs"
-            )
+            raise ValueError(f"Cannot resume {output_path}: its experiment configuration differs")
         record_id = result.get("record_id")
         budget_id = result.get("budget_id")
         if not isinstance(record_id, str) or not isinstance(budget_id, str):
@@ -1454,9 +1454,7 @@ def _verify_resume_checkpoint(output_path: Path, expected_fingerprint: str) -> N
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Cannot resume: checkpoint summary is invalid: {summary_path}") from exc
     if summary.get("experiment_fingerprint") != expected_fingerprint:
-        raise ValueError(
-            f"Cannot resume {output_path}: its checkpoint configuration differs"
-        )
+        raise ValueError(f"Cannot resume {output_path}: its checkpoint configuration differs")
 
 
 def _build_summary(
@@ -1469,6 +1467,7 @@ def _build_summary(
     started_at: datetime,
     started_clock: float,
     resumed_cells: int,
+    selected: Sequence[MockCase],
 ) -> dict[str, Any]:
     by_dataset: dict[str, dict[str, Any]] = {}
     for dataset_name in sorted({str(result["dataset"]) for result in results}):
@@ -1509,6 +1508,8 @@ def _build_summary(
         "planned_cells": planned_cells,
         "selected_records": planned_cells // len(_budget_grid(config)),
         "budget_cells_per_record": len(_budget_grid(config)),
+        "selection_digest": selection_digest(selected),
+        "selected_record_ids": [case.record_id for case in selected],
         "completed_cells": len(results),
         "remaining_cells": max(0, planned_cells - len(results)),
         "resumed_cells": resumed_cells,
@@ -1549,9 +1550,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     budgets = _budget_grid(config)
     output_path = _output_path(config)
     if output_path.exists() and not config.overwrite and not config.resume:
-        raise FileExistsError(
-            f"Output already exists: {output_path}; pass --resume or --overwrite"
-        )
+        raise FileExistsError(f"Output already exists: {output_path}; pass --resume or --overwrite")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fingerprint = _config_fingerprint(config)
@@ -1589,6 +1588,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         started_at=started_at,
         started_clock=started_clock,
         resumed_cells=resumed_cells,
+        selected=selected,
     )
     _write_summary(output_path, summary)
 
@@ -1696,6 +1696,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     started_at=started_at,
                     started_clock=started_clock,
                     resumed_cells=resumed_cells,
+                    selected=selected,
                 )
                 _write_summary(output_path, summary)
                 if config.fail_on_error and run.error:
@@ -1713,6 +1714,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         started_at=started_at,
         started_clock=started_clock,
         resumed_cells=resumed_cells,
+        selected=selected,
     )
     _write_summary(output_path, summary)
     return summary
@@ -1809,6 +1811,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--expected-selection-digest",
+        help=(
+            "Optional SHA-256 of the ordered selected record IDs. Distributed jobs "
+            "fail before model loading if their deterministic sample differs."
+        ),
+    )
+    parser.add_argument(
         "--region",
         action="append",
         default=[],
@@ -1872,6 +1881,11 @@ def _validated_config(
         parser.error("--osrm-timeout-seconds must be positive")
     if namespace.tsp_tolerance_km < 0:
         parser.error("--tsp-tolerance-km cannot be negative")
+    expected_selection_digest = namespace.expected_selection_digest
+    if expected_selection_digest is not None:
+        expected_selection_digest = expected_selection_digest.casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", expected_selection_digest) is None:
+            parser.error("--expected-selection-digest must be a 64-character SHA-256 hex digest")
     gpus = namespace.gpus.strip().casefold()
     if gpus not in {"none", "auto"}:
         gpu_parts = gpus.split(",")
@@ -1899,6 +1913,7 @@ def _validated_config(
         limit=namespace.limit,
         shuffle=namespace.shuffle,
         seed=namespace.seed,
+        expected_selection_digest=expected_selection_digest,
         regions=tuple(namespace.region),
         output=namespace.output,
         overwrite=namespace.overwrite,

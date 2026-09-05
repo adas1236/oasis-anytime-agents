@@ -34,6 +34,7 @@ dependencies = [
 
 [project.scripts]
 oasis = "oasis.cli:main"
+oasis-runpod = "oasis.runpod_experiments:main"
 
 [dependency-groups]
 # uv cannot install CPU and CUDA PyTorch wheels in one environment. Keep CPU as
@@ -47,6 +48,9 @@ gpu = [
   "accelerate>=1.10,<2",
   "torch>=2.8,<3",
   "torchvision>=0.23,<1",
+]
+runpod = [
+  "boto3>=1.40,<2",
 ]
 dev = [
   "hypothesis>=6.138,<7",
@@ -117,6 +121,7 @@ module = [
   "shapely.*",
   "torch.*",
   "transformers.*",
+  "boto3.*",
 ]
 ignore_missing_imports = true
 

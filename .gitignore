@@ -1,6 +1,7 @@
 # Ignore local planning notes while tracking only the root README.
 *.md
 !/README.md
+!/infra/runpod/README.md
 HARDWARE_CHANGES.md
 
 # Python bytecode and environments

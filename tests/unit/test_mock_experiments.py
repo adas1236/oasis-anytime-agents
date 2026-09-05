@@ -15,10 +15,12 @@ from oasis.mock_experiments import (
     _fake_backend,
     _run_agent_case,
     _score,
+    _select_cases,
     _validated_config,
     build_parser,
     load_dataset,
     run_experiment,
+    selection_digest,
     solve_max_coverage,
     solve_minimum_facility,
 )
@@ -47,6 +49,7 @@ def _config(tmp_path: Path) -> ExperimentConfig:
         limit=1,
         shuffle=False,
         seed=42,
+        expected_selection_digest=None,
         regions=(),
         output=tmp_path / "results.jsonl",
         overwrite=False,
@@ -100,6 +103,21 @@ def test_plaintext_lookup_accepts_case_punctuation_and_internal_id() -> None:
 
     assert index.resolve("JOHNS-HOPKINS hospital") == location
     assert index.resolve(location.location_id) == location
+
+
+def test_selection_digest_guards_distributed_random_sample(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.shuffle = True
+    config.limit = 10
+    selected, _ = _select_cases(config)
+
+    config.expected_selection_digest = selection_digest(selected)
+    repeated, _ = _select_cases(config)
+    assert [case.record_id for case in repeated] == [case.record_id for case in selected]
+
+    config.expected_selection_digest = "0" * 64
+    with pytest.raises(ValueError, match="Selected records do not match"):
+        _select_cases(config)
 
 
 def test_first_coverage_records_reproduce_the_supplied_oracles() -> None:

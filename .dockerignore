@@ -1,0 +1,31 @@
+.git
+.agents
+.codex
+.venv
+.uv-cache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.pyc
+
+# Never send local credentials or machine-specific launch scripts to a build.
+.env
+.env.*
+!.env.example
+secrets.env
+secrets/
+scripts/
+
+# Runtime state and caches are restored separately.
+logs/
+evaluation-output/
+artifacts/
+runs/
+data/cache/
+model-cache/
+hf-cache/
+.cache/
+
+ui/
+tests/

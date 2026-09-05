@@ -206,6 +206,12 @@ a scheduler and intentionally restricting visibility; use `--gpus none` for CPU-
 Transformer experiments default to `bfloat16` and SDPA; override `--dtype` when targeting hardware
 that does not support bfloat16.
 
+For reproducible Runpod benchmarks and full grids, see
+[`infra/runpod/README.md`](infra/runpod/README.md). The tracked workflow builds a deterministic
+dry-run plan, verifies the exact shuffled record selection inside every budget job, accepts GPU type
+and GPU count overrides, checkpoints to a volume and optionally S3, and keeps Pod creation/deletion
+behind explicit `--execute` flags.
+
 For `tsp`, the runner uses the coordinates already stored in JSON and requests OSRM driving
 distance tables; it does not geocode the names again. Because each geographic region has only ten
 unique locations, it requests and caches one regional table rather than making one request per

@@ -1,0 +1,1037 @@
+"""Plan, launch, and execute reproducible mock evaluations on Runpod Pods.
+
+Planning and API mutation are deliberately separate.  ``plan`` is local and
+read-only apart from its JSON output; ``launch`` and ``terminate`` only call the
+Runpod API when their explicit ``--execute`` flag is present.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import itertools
+import json
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import threading
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from oasis.mock_experiments import (
+    DATASET_FILES,
+    DatasetKind,
+    _parse_time_budgets,
+    _parse_token_budgets,
+    load_dataset,
+    selection_digest,
+)
+
+RUNPOD_API_BASE = "https://rest.runpod.io/v1"
+_SECRET_REFERENCE = re.compile(r"\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_-]+\s*\}\}")
+_SENSITIVE_ENV_NAME = re.compile(r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)", re.I)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanOverrides:
+    rows: int | None = None
+    seed: int | None = None
+    shards: int | None = None
+    time_budgets: str | None = None
+    token_budgets: str | None = None
+    gpu_types: tuple[str, ...] | None = None
+    gpu_count: int | None = None
+    model_type: str | None = None
+
+
+def _json_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-") or "experiment"
+
+
+def _section(document: Mapping[str, Any], name: str) -> dict[str, Any]:
+    value = document.get(name, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"TOML section [{name}] must be a table")
+    return value
+
+
+def _strings(value: Any, name: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a non-empty TOML array")
+    if any(not isinstance(item, (str, int, float)) for item in value):
+        raise ValueError(f"{name} values must be strings or numbers")
+    return [str(item) for item in value]
+
+
+def _positive_int(value: Any, name: str, *, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be {qualifier}")
+    return int(value)
+
+
+def _canonical_time_budgets(values: Sequence[str]) -> list[str]:
+    parsed = _parse_time_budgets(",".join(values))
+    return ["unlimited" if value is None else f"{value:g}s" for value in parsed]
+
+
+def _canonical_token_budgets(values: Sequence[str]) -> list[str]:
+    parsed = _parse_token_budgets(",".join(values))
+    return ["unlimited" if value is None else str(value) for value in parsed]
+
+
+def _split_sizes(total: int, parts: int) -> list[int]:
+    if parts > total:
+        raise ValueError("shards_per_condition cannot exceed rows_per_dataset")
+    quotient, remainder = divmod(total, parts)
+    return [quotient + (1 if index < remainder else 0) for index in range(parts)]
+
+
+def _safe_environment(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("[runpod.env] must be a TOML table")
+    result: dict[str, str] = {}
+    for raw_name, raw_value in value.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, (str, int, float, bool)):
+            raise ValueError("[runpod.env] keys and scalar values must be strings")
+        name = raw_name.strip()
+        item = str(raw_value)
+        if name.startswith("OASIS_") or name == "CUDA_VISIBLE_DEVICES":
+            raise ValueError(f"[runpod.env] cannot override reserved worker variable {name}")
+        if _SENSITIVE_ENV_NAME.search(name) and _SECRET_REFERENCE.fullmatch(item) is None:
+            raise ValueError(
+                f"Refusing to put a literal secret in the plan for {name}; use a "
+                "{{ RUNPOD_SECRET_name }} reference"
+            )
+        result[name] = item
+    return result
+
+
+def _selection_plan(
+    *, dataset: str, data_root: Path, rows: int, seed: int, shards: int
+) -> dict[str, Any]:
+    cases = load_dataset(DatasetKind(dataset), data_root / DATASET_FILES[dataset])
+    random.Random(seed).shuffle(cases)
+    if rows > len(cases):
+        raise ValueError(f"rows_per_dataset={rows} exceeds the {len(cases)} records in {dataset}")
+    chosen = cases[:rows]
+    chosen_ids = [case.record_id for case in chosen]
+    shard_specs: list[dict[str, Any]] = []
+    offset = 0
+    for index, size in enumerate(_split_sizes(rows, shards)):
+        record_ids = chosen_ids[offset : offset + size]
+        shard_specs.append(
+            {
+                "index": index,
+                "start": offset,
+                "limit": size,
+                "record_ids": record_ids,
+                "selection_digest": selection_digest(record_ids),
+            }
+        )
+        offset += size
+    return {
+        "dataset": dataset,
+        "rows": rows,
+        "seed": seed,
+        "record_ids": chosen_ids,
+        "selection_digest": selection_digest(chosen_ids),
+        "shards": shard_specs,
+    }
+
+
+def _job_environment(
+    *,
+    plan_id: str,
+    job_id: str,
+    experiment: Mapping[str, Any],
+    artifacts: Mapping[str, Any],
+    dataset: str,
+    time_budget: str,
+    token_budget: str,
+    seed: int,
+    shard: Mapping[str, Any],
+    gpu_count: int,
+) -> dict[str, str]:
+    values = {
+        "OASIS_PLAN_ID": plan_id,
+        "OASIS_JOB_ID": job_id,
+        "OASIS_DATASET": dataset,
+        "OASIS_TIME_BUDGET": time_budget,
+        "OASIS_TOKEN_BUDGET": token_budget,
+        "OASIS_SEED": str(seed),
+        "OASIS_START": str(shard["start"]),
+        "OASIS_LIMIT": str(shard["limit"]),
+        "OASIS_SELECTION_DIGEST": str(shard["selection_digest"]),
+        "OASIS_MODEL_TYPE": str(experiment["model_type"]),
+        "OASIS_MODEL_PROFILE": str(experiment["profile"]),
+        "OASIS_DTYPE": str(experiment["dtype"]),
+        "OASIS_QUANTIZATION": str(experiment["quantization"]),
+        "OASIS_ATTENTION_BACKEND": str(experiment["attention_backend"]),
+        "OASIS_THINKING": "1" if experiment["thinking"] else "0",
+        "OASIS_MAX_GENERATED_TOKENS": str(experiment["max_generated_tokens"]),
+        "OASIS_MAX_TOOL_ROUNDS": str(experiment["max_tool_rounds"]),
+        "OASIS_MAX_TOOL_CALLS": str(experiment["max_tool_calls"]),
+        "OASIS_MODEL_CALL_TIMEOUT": str(experiment["model_call_timeout"]),
+        "OASIS_OSRM_CACHE_ONLY": "1" if experiment["osrm_cache_only"] else "0",
+        "OASIS_OSRM_ENDPOINT": str(experiment["osrm_endpoint"]),
+        "OASIS_TSP_TOLERANCE_KM": str(experiment["tsp_tolerance_km"]),
+        "OASIS_EXPECTED_GPU_COUNT": str(gpu_count),
+        "OASIS_RESULTS_ROOT": str(artifacts["local_root"]),
+        "OASIS_RESULTS_S3_URI": str(artifacts["s3_uri"]),
+        "OASIS_UPLOAD_INTERVAL_SECONDS": str(artifacts["upload_interval_seconds"]),
+    }
+    if experiment.get("model"):
+        values["OASIS_MODEL_ID"] = str(experiment["model"])
+    if experiment.get("revision"):
+        values["OASIS_MODEL_REVISION"] = str(experiment["revision"])
+    return values
+
+
+def _pod_payload(
+    *,
+    pod_name: str,
+    runpod: Mapping[str, Any],
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    merged_environment = dict(environment) | dict(runpod["env"])
+    if len(merged_environment) > 50:
+        raise ValueError("Runpod permits at most 50 environment variables per Pod")
+    payload: dict[str, Any] = {
+        "name": pod_name[:191],
+        "imageName": runpod["image"],
+        "computeType": "GPU",
+        "cloudType": runpod["cloud_type"],
+        "gpuTypeIds": runpod["gpu_types"],
+        "gpuTypePriority": "availability",
+        "gpuCount": runpod["gpu_count"],
+        "containerDiskInGb": runpod["container_disk_gb"],
+        "volumeMountPath": runpod["volume_mount_path"],
+        "interruptible": runpod["interruptible"],
+        "supportPublicIp": False,
+        "ports": [],
+        "env": merged_environment,
+    }
+    if runpod["network_volume_id"]:
+        payload["networkVolumeId"] = runpod["network_volume_id"]
+    elif runpod["volume_disk_gb"]:
+        payload["volumeInGb"] = runpod["volume_disk_gb"]
+    if runpod["data_center_ids"]:
+        payload["dataCenterIds"] = runpod["data_center_ids"]
+        payload["dataCenterPriority"] = "availability"
+    if runpod["allowed_cuda_versions"]:
+        payload["allowedCudaVersions"] = runpod["allowed_cuda_versions"]
+    if runpod["min_vcpu_per_gpu"]:
+        payload["minVCPUPerGPU"] = runpod["min_vcpu_per_gpu"]
+    if runpod["min_ram_per_gpu_gb"]:
+        payload["minRAMPerGPU"] = runpod["min_ram_per_gpu_gb"]
+    if runpod["container_registry_auth_id"]:
+        payload["containerRegistryAuthId"] = runpod["container_registry_auth_id"]
+    return payload
+
+
+def build_plan(config_path: Path, overrides: PlanOverrides | None = None) -> dict[str, Any]:
+    """Build a deterministic plan without contacting Runpod."""
+
+    overrides = overrides or PlanOverrides()
+
+    try:
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Configuration does not exist: {config_path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Invalid TOML in {config_path}: {exc}") from exc
+    experiment_raw = _section(document, "experiment")
+    runpod_raw = _section(document, "runpod")
+    artifacts_raw = _section(document, "artifacts")
+
+    name = str(experiment_raw.get("name", "oasis-mock-eval"))
+    data_root = Path(str(experiment_raw.get("data_root", "data")))
+    if not data_root.is_absolute():
+        data_root = (config_path.parent / data_root).resolve()
+    dataset_values = _strings(
+        experiment_raw.get("datasets", list(DATASET_FILES)), "experiment.datasets"
+    )
+    datasets = list(dict.fromkeys(dataset_values))
+    if any(dataset not in DATASET_FILES for dataset in datasets):
+        raise ValueError(f"datasets must be chosen from {sorted(DATASET_FILES)}")
+    rows = _positive_int(
+        overrides.rows
+        if overrides.rows is not None
+        else experiment_raw.get("rows_per_dataset", 500),
+        "rows_per_dataset",
+    )
+    seed = _positive_int(
+        overrides.seed if overrides.seed is not None else experiment_raw.get("seed", 42),
+        "seed",
+        allow_zero=True,
+    )
+    shards = _positive_int(
+        overrides.shards
+        if overrides.shards is not None
+        else experiment_raw.get("shards_per_condition", 1),
+        "shards_per_condition",
+    )
+    raw_times = (
+        overrides.time_budgets.split(",")
+        if overrides.time_budgets is not None
+        else _strings(experiment_raw.get("time_budgets", ["unlimited"]), "time_budgets")
+    )
+    raw_tokens = (
+        overrides.token_budgets.split(",")
+        if overrides.token_budgets is not None
+        else _strings(experiment_raw.get("token_budgets", ["unlimited"]), "token_budgets")
+    )
+    time_budgets = _canonical_time_budgets(raw_times)
+    token_budgets = _canonical_token_budgets(raw_tokens)
+    model_type = overrides.model_type or str(experiment_raw.get("model_type", "transformers"))
+    if model_type not in {"fake", "transformers"}:
+        raise ValueError("model_type must be fake or transformers")
+
+    experiment: dict[str, Any] = {
+        "name": name,
+        "data_root": str(data_root),
+        "datasets": datasets,
+        "rows_per_dataset": rows,
+        "seed": seed,
+        "shards_per_condition": shards,
+        "time_budgets": time_budgets,
+        "token_budgets": token_budgets,
+        "model_type": model_type,
+        "profile": str(experiment_raw.get("profile", "gemma4_e2b_it")),
+        "model": experiment_raw.get("model"),
+        "revision": experiment_raw.get("revision"),
+        "dtype": str(experiment_raw.get("dtype", "bfloat16")),
+        "quantization": str(experiment_raw.get("quantization", "none")),
+        "attention_backend": str(experiment_raw.get("attention_backend", "sdpa")),
+        "thinking": bool(experiment_raw.get("thinking", True)),
+        "max_generated_tokens": _positive_int(
+            experiment_raw.get("max_generated_tokens", 768), "max_generated_tokens"
+        ),
+        "max_tool_rounds": _positive_int(
+            experiment_raw.get("max_tool_rounds", 4), "max_tool_rounds"
+        ),
+        "max_tool_calls": str(experiment_raw.get("max_tool_calls", "unlimited")),
+        "model_call_timeout": str(experiment_raw.get("model_call_timeout", "unlimited")),
+        "osrm_cache_only": bool(experiment_raw.get("osrm_cache_only", False)),
+        "osrm_endpoint": str(
+            experiment_raw.get("osrm_endpoint", "https://router.project-osrm.org")
+        ),
+        "tsp_tolerance_km": float(experiment_raw.get("tsp_tolerance_km", 1.0)),
+    }
+    image = str(runpod_raw.get("image", "")).strip()
+    if not image:
+        raise ValueError("runpod.image is required")
+    configured_gpu_types = _strings(
+        runpod_raw.get("gpu_types", ["NVIDIA GeForce RTX 5090"]), "runpod.gpu_types"
+    )
+    gpu_types = list(overrides.gpu_types or tuple(configured_gpu_types))
+    gpu_count = _positive_int(
+        overrides.gpu_count if overrides.gpu_count is not None else runpod_raw.get("gpu_count", 1),
+        "runpod.gpu_count",
+    )
+    cloud_type = str(runpod_raw.get("cloud_type", "SECURE")).upper()
+    if cloud_type not in {"SECURE", "COMMUNITY"}:
+        raise ValueError("runpod.cloud_type must be SECURE or COMMUNITY")
+    runpod: dict[str, Any] = {
+        "image": image,
+        "gpu_types": gpu_types,
+        "gpu_count": gpu_count,
+        "cloud_type": cloud_type,
+        "container_disk_gb": _positive_int(
+            runpod_raw.get("container_disk_gb", 60), "runpod.container_disk_gb"
+        ),
+        "volume_disk_gb": _positive_int(
+            runpod_raw.get("volume_disk_gb", 40),
+            "runpod.volume_disk_gb",
+            allow_zero=True,
+        ),
+        "volume_mount_path": str(runpod_raw.get("volume_mount_path", "/workspace")),
+        "network_volume_id": str(runpod_raw.get("network_volume_id", "")),
+        "container_registry_auth_id": str(runpod_raw.get("container_registry_auth_id", "")),
+        "interruptible": bool(runpod_raw.get("interruptible", False)),
+        "data_center_ids": _strings(runpod_raw["data_center_ids"], "data_center_ids")
+        if runpod_raw.get("data_center_ids")
+        else [],
+        "allowed_cuda_versions": _strings(
+            runpod_raw["allowed_cuda_versions"], "allowed_cuda_versions"
+        )
+        if runpod_raw.get("allowed_cuda_versions")
+        else [],
+        "min_vcpu_per_gpu": _positive_int(
+            runpod_raw.get("min_vcpu_per_gpu", 4), "runpod.min_vcpu_per_gpu"
+        ),
+        "min_ram_per_gpu_gb": _positive_int(
+            runpod_raw.get("min_ram_per_gpu_gb", 16), "runpod.min_ram_per_gpu_gb"
+        ),
+        "env": _safe_environment(runpod_raw.get("env")),
+    }
+    artifacts: dict[str, Any] = {
+        "local_root": str(artifacts_raw.get("local_root", "/workspace/oasis-results")),
+        "s3_uri": str(artifacts_raw.get("s3_uri", "")),
+        "upload_interval_seconds": _positive_int(
+            artifacts_raw.get("upload_interval_seconds", 60),
+            "artifacts.upload_interval_seconds",
+        ),
+    }
+    if artifacts["s3_uri"]:
+        _s3_location(artifacts["s3_uri"])
+    if not artifacts["s3_uri"] and not runpod["network_volume_id"] and not runpod["volume_disk_gb"]:
+        raise ValueError("Configure S3, a network volume, or a nonzero Pod volume for results")
+
+    selections = {
+        dataset: _selection_plan(
+            dataset=dataset,
+            data_root=data_root,
+            rows=rows,
+            seed=seed,
+            shards=shards,
+        )
+        for dataset in datasets
+    }
+    identity = {
+        "experiment": experiment,
+        "runpod": runpod,
+        "artifacts": artifacts,
+        "selection_digests": {
+            dataset: selection["selection_digest"] for dataset, selection in selections.items()
+        },
+    }
+    plan_id = f"{_slug(name)}-{_json_hash(identity)[:10]}"
+    jobs: list[dict[str, Any]] = []
+    for dataset, time_budget, token_budget in itertools.product(
+        datasets, time_budgets, token_budgets
+    ):
+        for shard in selections[dataset]["shards"]:
+            time_slug = _slug(time_budget)
+            token_slug = _slug(token_budget)
+            job_id = (
+                f"{dataset}__time-{time_slug}__tokens-{token_slug}__shard-{int(shard['index']):02d}"
+            )
+            environment = _job_environment(
+                plan_id=plan_id,
+                job_id=job_id,
+                experiment=experiment,
+                artifacts=artifacts,
+                dataset=dataset,
+                time_budget=time_budget,
+                token_budget=token_budget,
+                seed=seed,
+                shard=shard,
+                gpu_count=gpu_count,
+            )
+            pod_name = f"{plan_id}-{job_id}"
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "dataset": dataset,
+                    "time_budget": time_budget,
+                    "token_budget": token_budget,
+                    "shard_index": shard["index"],
+                    "start": shard["start"],
+                    "limit": shard["limit"],
+                    "selection_digest": shard["selection_digest"],
+                    "record_ids": shard["record_ids"],
+                    "pod_payload": _pod_payload(
+                        pod_name=pod_name,
+                        runpod=runpod,
+                        environment=environment,
+                    ),
+                }
+            )
+    plan: dict[str, Any] = {
+        "created_at": datetime.now(UTC).isoformat(),
+        "plan_id": plan_id,
+        "experiment": experiment,
+        "runpod": runpod,
+        "artifacts": artifacts,
+        "selections": selections,
+        "jobs": jobs,
+    }
+    plan["plan_fingerprint"] = _plan_fingerprint(plan)
+    return plan
+
+
+def _plan_fingerprint(plan: Mapping[str, Any]) -> str:
+    stable = {
+        key: value for key, value in plan.items() if key not in {"created_at", "plan_fingerprint"}
+    }
+    return _json_hash(stable)
+
+
+def _placeholder_paths(value: Any, path: str = "") -> list[str]:
+    matches: list[str] = []
+    if isinstance(value, str) and "REPLACE_" in value.upper():
+        matches.append(path or "<root>")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            matches.extend(_placeholder_paths(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            matches.extend(_placeholder_paths(item, f"{path}[{index}]"))
+    return matches
+
+
+def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_json_object(path: Path, description: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read {description} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must contain a JSON object: {path}")
+    return value
+
+
+def load_plan(path: Path) -> dict[str, Any]:
+    plan = _load_json_object(path, "plan")
+    if plan.get("plan_fingerprint") != _plan_fingerprint(plan):
+        raise ValueError(f"Plan fingerprint does not match its contents: {path}")
+    if not isinstance(plan.get("jobs"), list):
+        raise ValueError(f"Plan has no jobs array: {path}")
+    return plan
+
+
+class RunpodApi:
+    def __init__(self, api_key: str, base_url: str = RUNPOD_API_BASE) -> None:
+        if not api_key:
+            raise ValueError("RUNPOD_API_KEY is required for --execute")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    def request(self, method: str, path: str, payload: Mapping[str, Any] | None = None) -> Any:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/{path.lstrip('/')}",
+            data=body,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:2_000]
+            raise RuntimeError(f"Runpod API {method} {path} failed ({exc.code}): {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Runpod API {method} {path} failed: {exc.reason}") from exc
+        return json.loads(content) if content else None
+
+
+def _selected_jobs(
+    plan: Mapping[str, Any], requested_ids: Sequence[str], maximum: int | None
+) -> list[dict[str, Any]]:
+    jobs = plan["jobs"]
+    if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
+        raise ValueError("Plan jobs are malformed")
+    known = {str(job["job_id"]) for job in jobs}
+    unknown = set(requested_ids) - known
+    if unknown:
+        raise ValueError(f"Unknown job IDs: {sorted(unknown)}")
+    selected = [job for job in jobs if not requested_ids or job["job_id"] in requested_ids]
+    return selected if maximum is None else selected[:maximum]
+
+
+def _state_path(plan_path: Path, requested: Path | None) -> Path:
+    return requested or plan_path.with_suffix(".state.json")
+
+
+def _new_or_existing_state(path: Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+    if path.exists():
+        state = _load_json_object(path, "launch state")
+        if state.get("plan_fingerprint") != plan["plan_fingerprint"]:
+            raise ValueError("Launch state belongs to a different plan")
+        if not isinstance(state.get("pods"), dict):
+            raise ValueError("Launch state pods value is malformed")
+        return state
+    return {
+        "plan_id": plan["plan_id"],
+        "plan_fingerprint": plan["plan_fingerprint"],
+        "created_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
+        "pods": {},
+    }
+
+
+def launch_plan(
+    *,
+    plan_path: Path,
+    state_path: Path | None,
+    execute: bool,
+    requested_ids: Sequence[str] = (),
+    maximum: int | None = None,
+    print_payloads: bool = False,
+    api_base: str = RUNPOD_API_BASE,
+) -> int:
+    if maximum is not None and maximum < 1:
+        raise ValueError("maximum jobs must be positive")
+    plan = load_plan(plan_path)
+    path = _state_path(plan_path, state_path)
+    state = _new_or_existing_state(path, plan)
+    jobs = _selected_jobs(plan, requested_ids, maximum)
+    pending = [job for job in jobs if job["job_id"] not in state["pods"]]
+    print(
+        f"Plan {plan['plan_id']}: {len(jobs)} selected, {len(pending)} not yet launched; "
+        f"GPU={plan['runpod']['gpu_count']} x {plan['runpod']['gpu_types']}"
+    )
+    if print_payloads:
+        for job in pending:
+            print(json.dumps(job["pod_payload"], indent=2, ensure_ascii=False))
+    if not execute:
+        print("Dry run only: no Pods were created. Add --execute to launch them.")
+        return 0
+    placeholders = _placeholder_paths({"runpod": plan["runpod"], "artifacts": plan["artifacts"]})
+    if placeholders:
+        raise ValueError(
+            "Replace required configuration placeholders before launching: "
+            + ", ".join(placeholders)
+        )
+    if not pending:
+        print(f"Nothing to launch; existing state is {path}")
+        return 0
+    client = RunpodApi(os.environ.get("RUNPOD_API_KEY", ""), api_base)
+    for position, job in enumerate(pending, start=1):
+        print(f"[{position}/{len(pending)}] launching {job['job_id']}", file=sys.stderr)
+        created = client.request("POST", "/pods", job["pod_payload"])
+        if not isinstance(created, dict) or not isinstance(created.get("id"), str):
+            raise RuntimeError(f"Runpod returned no Pod ID for {job['job_id']}")
+        state["pods"][job["job_id"]] = {
+            "pod_id": created["id"],
+            "name": created.get("name", job["pod_payload"]["name"]),
+            "desired_status": created.get("desiredStatus"),
+            "cost_per_hour": created.get("costPerHr"),
+            "launched_at": datetime.now(UTC).isoformat(),
+            "terminated_at": None,
+        }
+        state["updated_at"] = datetime.now(UTC).isoformat()
+        _write_json(path, state)
+    print(f"Launch state: {path}")
+    return 0
+
+
+def show_status(*, state_path: Path, api_base: str = RUNPOD_API_BASE) -> int:
+    state = _load_json_object(state_path, "launch state")
+    pods = state.get("pods")
+    if not isinstance(pods, dict):
+        raise ValueError("Launch state pods value is malformed")
+    client = RunpodApi(os.environ.get("RUNPOD_API_KEY", ""), api_base)
+    rows: list[dict[str, Any]] = []
+    for job_id, item in pods.items():
+        if not isinstance(item, dict) or not isinstance(item.get("pod_id"), str):
+            raise ValueError(f"Malformed Pod state for {job_id}")
+        if item.get("terminated_at"):
+            rows.append({"job_id": job_id, "pod_id": item["pod_id"], "status": "TERMINATED"})
+            continue
+        query = urllib.parse.urlencode({"id": item["pod_id"]})
+        response = client.request("GET", f"/pods?{query}")
+        pod = response[0] if isinstance(response, list) and response else {}
+        rows.append(
+            {
+                "job_id": job_id,
+                "pod_id": item["pod_id"],
+                "status": pod.get("desiredStatus", "NOT_FOUND"),
+                "gpu": pod.get("gpu"),
+                "cost_per_hour": pod.get("costPerHr"),
+                "last_status_change": pod.get("lastStatusChange"),
+            }
+        )
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    return 0
+
+
+def terminate_pods(*, state_path: Path, execute: bool, api_base: str = RUNPOD_API_BASE) -> int:
+    state = _load_json_object(state_path, "launch state")
+    pods = state.get("pods")
+    if not isinstance(pods, dict):
+        raise ValueError("Launch state pods value is malformed")
+    pending = [
+        (job_id, item)
+        for job_id, item in pods.items()
+        if isinstance(item, dict) and not item.get("terminated_at")
+    ]
+    print(f"{len(pending)} Pods in {state_path} are eligible for permanent deletion.")
+    if not execute:
+        print("Dry run only: no Pods were deleted. Add --execute after verifying artifacts.")
+        return 0
+    if not pending:
+        return 0
+    client = RunpodApi(os.environ.get("RUNPOD_API_KEY", ""), api_base)
+    for position, (job_id, item) in enumerate(pending, start=1):
+        pod_id = item.get("pod_id")
+        if not isinstance(pod_id, str):
+            raise ValueError(f"Malformed Pod ID for {job_id}")
+        print(f"[{position}/{len(pending)}] deleting {job_id} ({pod_id})", file=sys.stderr)
+        client.request("DELETE", f"/pods/{urllib.parse.quote(pod_id, safe='')}")
+        item["terminated_at"] = datetime.now(UTC).isoformat()
+        item["desired_status"] = "TERMINATED"
+        state["updated_at"] = datetime.now(UTC).isoformat()
+        _write_json(state_path, state)
+    return 0
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"Container environment variable {name} is required")
+    return value
+
+
+def _runner_arguments(output: Path) -> list[str]:
+    arguments = [
+        sys.executable,
+        "-m",
+        "oasis.run_mock_experiment",
+        "--model-type",
+        _required_env("OASIS_MODEL_TYPE"),
+        "--profile",
+        _required_env("OASIS_MODEL_PROFILE"),
+        "--dataset",
+        _required_env("OASIS_DATASET"),
+        "--gpus",
+        "auto",
+        "--dtype",
+        _required_env("OASIS_DTYPE"),
+        "--quantization",
+        _required_env("OASIS_QUANTIZATION"),
+        "--attention-backend",
+        _required_env("OASIS_ATTENTION_BACKEND"),
+        "--time-budgets",
+        _required_env("OASIS_TIME_BUDGET"),
+        "--token-budgets",
+        _required_env("OASIS_TOKEN_BUDGET"),
+        "--max-generated-tokens",
+        _required_env("OASIS_MAX_GENERATED_TOKENS"),
+        "--max-tool-rounds",
+        _required_env("OASIS_MAX_TOOL_ROUNDS"),
+        "--max-tool-calls",
+        _required_env("OASIS_MAX_TOOL_CALLS"),
+        "--model-call-timeout-seconds",
+        _required_env("OASIS_MODEL_CALL_TIMEOUT"),
+        "--start",
+        _required_env("OASIS_START"),
+        "--limit",
+        _required_env("OASIS_LIMIT"),
+        "--shuffle",
+        "--seed",
+        _required_env("OASIS_SEED"),
+        "--expected-selection-digest",
+        _required_env("OASIS_SELECTION_DIGEST"),
+        "--osrm-endpoint",
+        _required_env("OASIS_OSRM_ENDPOINT"),
+        "--osrm-cache",
+        "/workspace/cache/osrm",
+        "--tsp-tolerance-km",
+        _required_env("OASIS_TSP_TOLERANCE_KM"),
+        "--output",
+        str(output),
+        "--resume",
+    ]
+    arguments.append("--thinking" if _required_env("OASIS_THINKING") == "1" else "--no-thinking")
+    if os.environ.get("OASIS_OSRM_CACHE_ONLY") == "1":
+        arguments.append("--osrm-cache-only")
+    if model := os.environ.get("OASIS_MODEL_ID", "").strip():
+        arguments.extend(("--model", model))
+    if revision := os.environ.get("OASIS_MODEL_REVISION", "").strip():
+        arguments.extend(("--revision", revision))
+    return arguments
+
+
+def _s3_location(uri: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError("artifacts.s3_uri must be empty or an s3://bucket/prefix URI")
+    return parsed.netloc, parsed.path.strip("/")
+
+
+class ArtifactSync:
+    def __init__(self, local_dir: Path, s3_uri: str) -> None:
+        self.local_dir = local_dir
+        self.s3_uri = s3_uri.strip()
+        self.bucket = ""
+        self.prefix = ""
+        self.client: Any = None
+        if self.s3_uri:
+            self.bucket, self.prefix = _s3_location(self.s3_uri)
+            try:
+                boto3 = importlib.import_module("boto3")
+            except ImportError as exc:
+                raise RuntimeError("S3 artifact sync requires the Runpod dependency group") from exc
+            endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+            self.client = boto3.client("s3", endpoint_url=endpoint)
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    def _key(self, path: Path) -> str:
+        relative = path.relative_to(self.local_dir).as_posix()
+        return "/".join(part for part in (self.prefix, relative) if part)
+
+    def restore(self) -> None:
+        if not self.enabled:
+            return
+        for name in ("results.jsonl", "results.summary.json", "results.jsonl.interrupted"):
+            destination = self.local_dir / name
+            if destination.exists():
+                continue
+            temporary = destination.with_suffix(destination.suffix + ".download")
+            try:
+                self.client.download_file(self.bucket, self._key(destination), str(temporary))
+            except self.client.exceptions.ClientError as exc:
+                code = str(exc.response.get("Error", {}).get("Code", ""))
+                if code not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+                continue
+            temporary.replace(destination)
+
+    def upload(self) -> None:
+        if not self.enabled:
+            return
+        for path in self.local_dir.iterdir():
+            if path.is_file() and not path.name.endswith((".tmp", ".download")):
+                self.client.upload_file(str(path), self.bucket, self._key(path))
+
+
+def _gpu_inventory() -> dict[str, Any]:
+    torch = importlib.import_module("torch")
+    devices = []
+    for index in range(int(torch.cuda.device_count())):
+        properties = torch.cuda.get_device_properties(index)
+        devices.append(
+            {
+                "index": index,
+                "name": str(properties.name),
+                "total_memory_bytes": int(properties.total_memory),
+                "compute_capability": f"{properties.major}.{properties.minor}",
+            }
+        )
+    return {
+        "pod_id": os.environ.get("RUNPOD_POD_ID"),
+        "torch_version": str(torch.__version__),
+        "cuda_runtime": str(getattr(torch.version, "cuda", None)),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "devices": devices,
+    }
+
+
+def worker_main() -> int:
+    """Run one planned condition inside a Pod and continuously persist artifacts."""
+
+    plan_id = _required_env("OASIS_PLAN_ID")
+    job_id = _required_env("OASIS_JOB_ID")
+    expected_gpus = int(_required_env("OASIS_EXPECTED_GPU_COUNT"))
+    root = Path(_required_env("OASIS_RESULTS_ROOT"))
+    local_dir = root / plan_id / job_id
+    local_dir.mkdir(parents=True, exist_ok=True)
+    output = local_dir / "results.jsonl"
+    status_path = local_dir / "job-status.json"
+    stdout_path = local_dir / "runner.out.log"
+    stderr_path = local_dir / "runner.err.log"
+    configured_s3_uri = os.environ.get("OASIS_RESULTS_S3_URI", "").rstrip("/")
+    job_s3_uri = f"{configured_s3_uri}/{plan_id}/{job_id}" if configured_s3_uri else ""
+    sync = ArtifactSync(local_dir, job_s3_uri)
+    sync.restore()
+    hardware = _gpu_inventory()
+    visible_gpus = len(hardware["devices"])
+    if visible_gpus != expected_gpus:
+        raise RuntimeError(
+            f"Runpod allocated {visible_gpus} visible GPUs; plan requires {expected_gpus}"
+        )
+    arguments = _runner_arguments(output)
+    started_at = datetime.now(UTC)
+    _write_json(
+        status_path,
+        {
+            "status": "running",
+            "plan_id": plan_id,
+            "job_id": job_id,
+            "started_at": started_at.isoformat(),
+            "visible_gpu_count": visible_gpus,
+            "hardware": hardware,
+            "selection_digest": os.environ["OASIS_SELECTION_DIGEST"],
+        },
+    )
+    stop_upload = threading.Event()
+    upload_interval = int(_required_env("OASIS_UPLOAD_INTERVAL_SECONDS"))
+
+    def upload_periodically() -> None:
+        while not stop_upload.wait(upload_interval):
+            try:
+                sync.upload()
+            except Exception as exc:  # the final upload will retry
+                print(f"Periodic artifact upload failed: {exc}", file=sys.stderr)
+
+    uploader = threading.Thread(target=upload_periodically, daemon=True)
+    if sync.enabled:
+        uploader.start()
+    process: subprocess.Popen[bytes] | None = None
+
+    def forward_signal(number: int, _frame: Any) -> None:
+        if process is not None and process.poll() is None:
+            process.send_signal(number)
+
+    previous_term = signal.signal(signal.SIGTERM, forward_signal)
+    previous_int = signal.signal(signal.SIGINT, forward_signal)
+    return_code = 1
+    upload_error: str | None = None
+    try:
+        with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+            process = subprocess.Popen(arguments, stdout=stdout, stderr=stderr)
+            return_code = process.wait()
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+        stop_upload.set()
+        if uploader.is_alive():
+            uploader.join(timeout=5)
+        finished_at = datetime.now(UTC)
+        status = {
+            "status": "complete" if return_code == 0 else "failed",
+            "plan_id": plan_id,
+            "job_id": job_id,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "elapsed_seconds": (finished_at - started_at).total_seconds(),
+            "runner_exit_code": return_code,
+            "visible_gpu_count": visible_gpus,
+            "hardware": hardware,
+            "selection_digest": os.environ["OASIS_SELECTION_DIGEST"],
+        }
+        _write_json(status_path, status)
+        try:
+            sync.upload()
+        except Exception as exc:
+            upload_error = f"{type(exc).__name__}: {exc}"
+            status["status"] = "artifact_upload_failed"
+            status["artifact_upload_error"] = upload_error
+            _write_json(status_path, status)
+            print(f"Final artifact upload failed: {upload_error}", file=sys.stderr)
+    return return_code if upload_error is None else 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    plan = commands.add_parser("plan", help="Create a deterministic JSON launch plan.")
+    plan.add_argument("--config", type=Path, required=True)
+    plan.add_argument("--output", type=Path, required=True)
+    plan.add_argument("--overwrite", action="store_true")
+    plan.add_argument("--rows", type=int)
+    plan.add_argument("--seed", type=int)
+    plan.add_argument("--shards", type=int)
+    plan.add_argument("--time-budgets")
+    plan.add_argument("--token-budgets")
+    plan.add_argument("--gpu-type", action="append", dest="gpu_types")
+    plan.add_argument("--gpu-count", type=int)
+    plan.add_argument("--model-type", choices=["fake", "transformers"])
+
+    launch = commands.add_parser("launch", help="Preview or create Pods from a plan.")
+    launch.add_argument("--plan", type=Path, required=True)
+    launch.add_argument("--state", type=Path)
+    launch.add_argument("--job-id", action="append", default=[])
+    launch.add_argument("--max-jobs", type=int)
+    launch.add_argument("--print-payloads", action="store_true")
+    launch.add_argument("--execute", action="store_true")
+    launch.add_argument("--api-base", default=RUNPOD_API_BASE, help=argparse.SUPPRESS)
+
+    status = commands.add_parser("status", help="Query Runpod for Pods in a launch state.")
+    status.add_argument("--state", type=Path, required=True)
+    status.add_argument("--api-base", default=RUNPOD_API_BASE, help=argparse.SUPPRESS)
+
+    terminate = commands.add_parser(
+        "terminate", help="Preview or permanently delete Pods in a launch state."
+    )
+    terminate.add_argument("--state", type=Path, required=True)
+    terminate.add_argument("--execute", action="store_true")
+    terminate.add_argument("--api-base", default=RUNPOD_API_BASE, help=argparse.SUPPRESS)
+
+    commands.add_parser("worker", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.command == "plan":
+            if arguments.output.exists() and not arguments.overwrite:
+                raise ValueError(
+                    f"Plan already exists: {arguments.output}; pass --overwrite to replace it"
+                )
+            plan = build_plan(
+                arguments.config,
+                PlanOverrides(
+                    rows=arguments.rows,
+                    seed=arguments.seed,
+                    shards=arguments.shards,
+                    time_budgets=arguments.time_budgets,
+                    token_budgets=arguments.token_budgets,
+                    gpu_types=tuple(arguments.gpu_types) if arguments.gpu_types else None,
+                    gpu_count=arguments.gpu_count,
+                    model_type=arguments.model_type,
+                ),
+            )
+            _write_json(arguments.output, plan)
+            print(
+                f"Wrote {len(plan['jobs'])} jobs for {plan['experiment']['rows_per_dataset']} "
+                f"rows/dataset to {arguments.output} (plan {plan['plan_id']})"
+            )
+            return 0
+        if arguments.command == "launch":
+            return launch_plan(
+                plan_path=arguments.plan,
+                state_path=arguments.state,
+                execute=arguments.execute,
+                requested_ids=arguments.job_id,
+                maximum=arguments.max_jobs,
+                print_payloads=arguments.print_payloads,
+                api_base=arguments.api_base,
+            )
+        if arguments.command == "status":
+            return show_status(state_path=arguments.state, api_base=arguments.api_base)
+        if arguments.command == "terminate":
+            return terminate_pods(
+                state_path=arguments.state,
+                execute=arguments.execute,
+                api_base=arguments.api_base,
+            )
+        return worker_main()
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
