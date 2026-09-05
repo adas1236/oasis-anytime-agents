@@ -75,6 +75,13 @@ class SuitabilityPredicate(StrEnum):
 
 
 class BuildCandidatesInput(BaseModel):
+    """For supplied mode, require artifact_id and omit all grid inputs.
+
+    For grid mode, require grid_bounds, grid_spacing, and grid_crs and omit
+    artifact_id. Supply minimum_spacing and spacing_units together; nonempty
+    allowed_suitability_values requires suitability_field.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     mode: CandidateGenerationMode

@@ -85,7 +85,7 @@ def test_gemma_adapter_passes_native_tool_schema_to_template() -> None:
             "function": {
                 "name": "later",
                 "description": "Implemented in phase 2.",
-                "parameters": {"type": "object"},
+                "parameters": {"type": "object", "properties": {}},
             },
         }
     ]

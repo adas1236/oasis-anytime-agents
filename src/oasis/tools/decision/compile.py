@@ -41,7 +41,15 @@ from oasis.tools.protocols import ToolContext
 
 
 class CompileProblemInput(BaseModel):
-    """Typed union of location and route compilation inputs selected by ``type_id``."""
+    """Select the compilation inputs and policy using type_id.
+
+    Location types require demand_spec_artifact_id, candidate_spec_artifact_id,
+    access_matrix_artifact_id, nonempty service_matrix_artifact_ids, need_field,
+    and a LocationAllocationPolicy. Route types (tsp, orienteering,
+    mobile_service_route) require nodes_artifact_id, node_id_field, nonempty
+    travel_matrix_artifact_ids, and a RouteServicePolicy including depot_ids,
+    shift_length, and time_units. Supply artifact IDs returned by prior tools.
+    """
 
     model_config = ConfigDict(frozen=True)
 

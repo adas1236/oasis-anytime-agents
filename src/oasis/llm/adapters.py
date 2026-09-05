@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from oasis.errors import ModelBackendError, ModelErrorCode, ModelErrorDetail, ToolCallParseError
+from oasis.llm.gemma_schema import gemma_tool_schema
 from oasis.llm.schemas import ChatMessage, ChatRole, ModelCapabilities, ToolCall, ToolDefinition
 
 
@@ -569,7 +570,7 @@ class Gemma4ChatAdapter:
     ) -> Mapping[str, Any]:
         extra: dict[str, Any] = {"enable_thinking": thinking_enabled}
         if tools:
-            extra["tools"] = [tool.transformers_schema() for tool in tools]
+            extra["tools"] = [gemma_tool_schema(tool) for tool in tools]
         return _apply_template(
             processor,
             _gemma_message_dicts(messages),

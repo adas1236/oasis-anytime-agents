@@ -72,6 +72,16 @@ class DistanceUnits(StrEnum):
 
 
 class TravelMatrixInput(BaseModel):
+    """Build travel costs with strategy-specific inputs.
+
+    For euclidean, geodesic, or haversine, omit graph_artifact_id,
+    origin_graph_node_field, destination_graph_node_field, routing_profile, and
+    route_annotation. For graph_shortest_path, supply all three graph fields and
+    omit routing_profile and route_annotation. For routed_provider, omit all
+    three graph fields and supply routing_profile and route_annotation; distance
+    requires output_units=meters and duration requires output_units=seconds.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     origins_artifact_id: str = Field(pattern=r"^sha256-[0-9a-f]{64}$")
@@ -172,6 +182,13 @@ class PiecewisePoint(BaseModel):
 
 
 class ServiceMatrixInput(BaseModel):
+    """Choose only the parameters for the selected strategy.
+
+    binary_threshold requires threshold; piecewise requires at least two
+    piecewise_points with strictly increasing access and non-increasing benefit;
+    exponential_decay requires decay_scale. Omit the other strategy parameters.
+    """
+
     model_config = ConfigDict(frozen=True)
 
     access_matrix_artifact_id: str = Field(pattern=r"^sha256-[0-9a-f]{64}$")
