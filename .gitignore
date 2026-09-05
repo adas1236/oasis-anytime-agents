@@ -57,6 +57,7 @@ hf-cache/
 
 # Generated evidence, artifacts, run state, and evaluation output
 .oasis/
+.gradio/
 data/generated/
 data/cache/
 # Only ignore root output; src/oasis/artifacts contains source code.

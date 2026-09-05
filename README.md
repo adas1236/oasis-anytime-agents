@@ -951,6 +951,59 @@ usable without those files.
 
 ## Independent web interface
 
+### Temporary public URL
+
+Add `--share` to the normal `oasis serve --serve-ui` command to print a public HTTPS URL
+and password. The existing UI and API are shared together; no separate tunnel command or
+frontend build is needed. It uses the same automatic Gradio tunnel as `launch(share=True)`,
+giving you a `https://....gradio.live` link with **no ngrok, account, token, or manual port
+forwarding**. The existing OASIS UI is retained, not replaced by Gradio components.
+The relay can process your requests and responses; only use it where permitted by your
+network policy, and do not share sensitive data.
+
+One-time dependency setup (CPU demo):
+
+```bash
+uv sync --frozen --extra share
+```
+
+For a CUDA environment instead, use `uv sync --frozen --extra share --no-group cpu --group gpu`.
+Then start the server on the GPU machine (no tunnel credentials to configure):
+
+```bash
+uv run --no-sync oasis serve --backend fake --serve-ui --share
+```
+
+For real GPU inference, replace the last command with:
+
+```bash
+uv run --no-sync oasis serve --backend transformers --profile gemma4_e2b_it \
+  --probe-cuda --device cuda --dtype bfloat16 --attention-backend sdpa \
+  --serve-ui --share
+```
+
+Open the printed HTTPS URL and enter username `oasis` and the generated password. The fake
+backend only echoes messages. Real inference also needs model access and sufficient GPU memory.
+The tunnel remains available only while this process is running; Ctrl+C closes it. Gradio
+share links are temporary and subject to the relay's expiration and availability limits.
+See [Gradio sharing](https://www.gradio.app/guides/sharing-your-app/). First use automatically
+downloads Gradio's checksum-verified FRP executable into the Hugging Face cache and writes a
+relay certificate under `.gradio/` (gitignored). The server needs outbound internet access and
+writable cache/working directories; the browser does not need the university VPN for this link.
+Startup is bounded to 90 seconds, and failure or shutdown cleans up the relay worker and tunnel.
+The optional Gradio version is pinned because its internal sharing helper is used directly.
+
+Every UI/API route (including run data and streaming events) requires the password in share mode,
+including local requests. Optionally set `OASIS_SHARE_PASSWORD` in the environment to keep a
+stable password (at least 12 printable ASCII characters); configured passwords are not printed.
+Otherwise, protect the terminal output because it contains the generated password. Credentials
+grant access to the whole application, not per-user isolated sessions: visitors can submit GPU
+work and access saved run data. Use separate `--artifact-root` and `--run-root` directories for
+public demos if needed. The local server must remain on a loopback host; `--host 0.0.0.0` is
+rejected with `--share`. Without `--share`, no tunnel is opened and local behavior is unchanged.
+
+### Local demo
+
 Launch the complete offline UI demonstration with the fake backend:
 
 ```bash
