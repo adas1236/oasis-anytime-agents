@@ -569,7 +569,7 @@ def solve_ortools(
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 0
-    if max_time_seconds is not None:
+    if max_time_seconds is not None and math.isfinite(max_time_seconds):
         solver.parameters.max_time_in_seconds = max(0.001, max_time_seconds / len(stages))
     stage_results: list[JsonValue] = []
     all_optimal = True

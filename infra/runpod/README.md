@@ -6,11 +6,49 @@ and API mutations require an explicit `--execute`.
 After syncing the updated project, `oasis-runpod` is a shorthand for
 `python -m oasis.runpod_experiments`.
 
+## Registry evaluation restart
+
+The current configuration uses `tool_mode = "registry"`: the application's full 21-tool catalog,
+with dataset-backed provider adapters instead of the old two-tool solver shortcut. Models see only
+the prompt, definitions, and tool results. The evaluator never fills in missing names or parameters.
+See the repository README's mock-experiment section for the data boundary and scoring details.
+
+Keep the previous Pods stopped. Their saved results use a different protocol; do not resume their
+old plan or mix those rows into the new evaluation. Stopped Pods retain disks and may incur storage
+charges until explicitly deleted. The new config uses a separate `oasis-registry-200-row-grid`
+name and `runpod-eval-v5` image. No existing launch-state files are changed by generating a new plan.
+
+Before building, run this offline, no-GPU check from the repository root (use a fresh output path
+on subsequent runs):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m oasis.registry_smoke \
+  --output evaluation-output/registry-smoke
+```
+
+The Docker build repeats a one-row-per-dataset acceptance check. This verifies tool contracts,
+restored artifact storage, source adapters, and scoring, not real-model performance. After the
+image is published, first create a short pilot plan without launching anything:
+
+```bash
+uv run --no-sync python -m oasis.runpod_experiments plan \
+  --config infra/runpod/experiment.toml \
+  --output evaluation-output/runpod/registry-pilot.json \
+  --rows 3 --time-budgets unlimited --token-budgets unlimited
+```
+
+Launch a pilot only when ready to incur GPU charges, using the lifecycle commands below and this
+new plan path. Inspect all three datasets before launching the full grid. The config preserves
+200 rows, seed 42, one RTX 5090, 27 conditions, and 30s/60s/unlimited wall budgets. It raises the
+round cap to 20 and generation cap to 1536. The provisional aggregate token budgets are now
+32k/256k/unlimited, because the full catalog is charged on every turn. Recalibrate token and wall
+budgets against pilot traces; previous two-tool runtime and cost estimates are not transferable.
+
 ## One-time setup
 
 1. After committing and pushing these files, open the repository's **Actions**
    tab, choose **Build Runpod evaluation image**, select **Run workflow**, and
-   leave the tag as `runpod-eval-v4`. The manual workflow publishes the exact
+   leave the tag as `runpod-eval-v5`. The manual workflow publishes the exact
    image already named in `experiment.toml`; it does not need any added GitHub
    secrets. The workflow summary records the immutable image digest and manifest.
 
@@ -27,8 +65,8 @@ After syncing the updated project, `oasis-runpod` is a shorthand for
    ```bash
    docker login ghcr.io -u adas1236
    docker build --platform=linux/amd64 -f infra/runpod/Dockerfile \
-     -t ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4 .
-   docker push ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4
+     -t ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v5 .
+   docker push ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v5
    ```
 
    If the GHCR package must remain private, create a Runpod container-registry
@@ -168,7 +206,8 @@ These plans select identical rows. Compare `job-status.json` for total Pod-job
 time and `results.summary.json` for evaluator time and per-row token/timing
 statistics. Then use the winning GPU in the 27-condition timing plan.
 
-Create the full 500-row plan using the TOML defaults:
+Create the full 200-row plan using the TOML defaults. The seeded ordered sample
+is shared by all nine budget conditions for each dataset:
 
 ```bash
 uv run --no-sync python -m oasis.runpod_experiments plan \
@@ -221,6 +260,15 @@ layout as `local_root`; for example:
 ```bash
 aws s3 sync s3://BUCKET/PREFIX/PLAN_ID evaluation-output/runpod/results/PLAN_ID
 ```
+
+Each job saves `results.jsonl` and `results.summary.json`, plus
+`results.artifacts/RECORD_ID/BUDGET_ID/attempts/ATTEMPT_ID/trace.jsonl` and its sibling `artifacts/`
+object store. Unique attempt directories prevent retries from overwriting old traces.
+Trace lines include complete model turns, arguments/results, streamed candidates, and independently
+scored incumbents—even before a row completes. Uploads recurse into these directories, skip
+unchanged files and temporary writes, and occur every 15 seconds by default. This is a best-effort
+sync interval, not a strict maximum loss guarantee if storage/network writes stall. Resume restores
+completed-row checkpoints; an unfinished cell is re-executed, not resumed inside its model turn.
 
 Once the matching launch state and result tree are local, produce a stage-by-stage
 cost report:

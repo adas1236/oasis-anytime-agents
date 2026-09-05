@@ -155,20 +155,31 @@ and torchrun implementation.
 
 ## Mock dataset experiments
 
-The three JSON files in `data/` can be exercised through one runner. The dataset selection
-determines the problem family; records do not need a separate problem-type field. Location tools
-accept the plaintext names found in each prompt, while the runner creates normalized IDs only for
-internal lookup. Angles are interpreted as degrees and distances as kilometers.
+The three JSON files in `data/` can be exercised through one runner. By default, `--tool-mode
+registry` exposes the same 21 tools and argument schemas as the application registry. Only the
+I/O providers are replaced with dataset-backed location/catalog sources and frozen OSRM matrices.
+This retains the evaluator's model loop and budget accounting; it is not a replay of the
+application controller's entire orchestration policy.
+The model receives a common system prompt, the record's natural-language prompt, tool definitions,
+and tool results. It must infer the problem family, resolve plaintext names, choose candidates,
+construct evidence, and supply solver parameters itself. Neither `case.locations`, the answer,
+the cheap fallback, nor hidden case parameters are injected into its context.
 
-Run a small, offline infrastructure smoke test first. `fake` drives the same model/tool loop with a
-scripted solver call and loads no model weights:
+Two general-purpose tools also join the live registry: `materialize_locations` turns explicitly
+selected geocoder candidate IDs into point artifacts, and `inspect_artifact` pages tool-produced
+evidence/plans. The former never selects missing or ambiguous names for the model. Coverage uses
+the explicit spherical `haversine` travel strategy to match the toy labels; road tours use
+`routed_provider` and directed OSRM distance weights. Angles are degrees, prompt distances are
+kilometers, and the OSRM tool contract labels its matrix in meters. There are no frozen road
+durations or raw OSM graphs: requests requiring those data fail rather than fabricate weights.
+
+Run the offline acceptance check first. It exercises three seed-42 rows per dataset and fails on
+bad registry wiring. `fake` is a scripted prompt-and-tool-results-only recipe, not a measure of model
+quality or real token usage. It loads no model weights and makes no network requests:
 
 ```bash
-uv run --no-sync python src/oasis/run_mock_experiment.py \
-  --model-type fake \
-  --gpus none \
-  --dataset max_coverage \
-  --limit 10
+PYTHONPATH=src .venv/bin/python -m oasis.registry_smoke \
+  --output evaluation-output/registry-smoke
 ```
 
 Run a real local model on selected GPUs by changing the model type and profile (or pass a custom
@@ -180,8 +191,9 @@ uv run --no-sync python src/oasis/run_mock_experiment.py \
   --profile gemma4_e2b_it \
   --gpus 0,1 \
   --dataset minimum_facility \
-  --time-budgets 10s,60s,unlimited \
-  --token-budgets 2k,8k,unlimited \
+  --time-budgets 30s,60s,unlimited \
+  --token-budgets 32k,256k,unlimited \
+  --osrm-cache infra/runpod/osrm-cache --osrm-cache-only \
   --limit 100 \
   --output evaluation-output/minimum-facility.jsonl
 ```
@@ -189,16 +201,30 @@ uv run --no-sync python src/oasis/run_mock_experiment.py \
 Those two lists form a Cartesian grid: the example runs nine budget cells for each selected
 record. A token budget is the aggregate input plus generated token count across every model turn
 for that cell; reasoning tokens are reported separately but are already part of generated tokens.
+The full tool catalog is charged on each turn. These larger token budgets are provisional, not
+calibrated runtime recommendations: use a small unlimited-budget real-model pilot and inspect
+`initial_input_tokens` and total usage before launching a grid. The earlier 2k/8k settings and
+four-round cap were intended for the legacy two-tool loop, not this longer workflow. Registry
+evaluations default to 20 tool rounds; the model is not required to use all of them.
 `unlimited` may be used independently for either dimension, and the default is unlimited for both.
 `--max-generated-tokens` remains a per-generation cap rather than an anytime budget. The optional
 `--max-tool-calls` and `--model-call-timeout-seconds` safety limits also default to unlimited.
 
 Every cell begins with a cheap feasible baseline. Baseline construction, model loading, and the
 shared static OSRM matrix load are recorded as setup rather than charged to the cell budget. With a
-zero time or token budget, the result is therefore the baseline. The current mock solver is exact,
-so the observable incumbent path is usually baseline-to-optimum rather than a gradual optimization
-curve; `incumbent_timeline`, `terminal_reason`, `requested_budget`, and `consumed_budget` make that
-explicit in each JSONL record.
+zero time or token budget, the result is therefore the baseline. Real `improve` candidate events
+update the incumbent as they arrive, not just at tool completion. A separate observer checks
+decisions against original populations, radius/target/depot constraints and road weights; it never
+returns hidden grading feedback to the model. `incumbent_timeline`, `terminal_reason`,
+`requested_budget`, and `consumed_budget` record the anytime outcome.
+
+`agent_plan_found` distinguishes actual model-produced feasible plans from evaluator fallback.
+`correct` retains exact reference-answer matching. `objective_correct` also accepts maximum
+coverage achieved using fewer than the allowed number of centers (the prompts say "may place");
+the labels enumerate only exact-count solutions. Both scores appear in the incumbent timeline;
+summaries report `accuracy` and `objective_accuracy`. Neither includes a bonus for a tool's
+self-reported score. `failures` separates malformed model output, invalid arguments, missing
+artifacts/provider errors, infeasible compiled problems, and independently rejected plans.
 
 The default `--gpus auto` mode preserves `CUDA_VISIBLE_DEVICES` and lets the Python runtime inspect
 however many devices the scheduler exposed. Pass an explicit device list only when running outside
@@ -212,8 +238,8 @@ dry-run plan, verifies the exact shuffled record selection inside every budget j
 and GPU count overrides, checkpoints to a volume and optionally S3, and keeps Pod creation/deletion
 behind explicit `--execute` flags.
 
-For `tsp`, the runner uses the coordinates already stored in JSON and requests OSRM driving
-distance tables; it does not geocode the names again. Because each geographic region has only ten
+The location provider resolves names against coordinates already stored in JSON, without live
+geocoding. The routing provider uses cached OSRM driving-distance tables. Because each region has ten
 unique locations, it requests and caches one regional table rather than making one request per
 example. Later runs can prohibit network fallback with `--osrm-cache-only`:
 
@@ -223,7 +249,7 @@ uv run --no-sync python src/oasis/run_mock_experiment.py \
   --profile gemma4_e2b_it \
   --gpus 0 \
   --dataset tsp \
-  --osrm-cache data/cache/osrm
+  --osrm-cache infra/runpod/osrm-cache --osrm-cache-only
 ```
 
 Omit `--limit` to process the full selected dataset, use `--dataset all` for all three, and repeat
@@ -234,6 +260,20 @@ is interrupted, rerun the identical command with `--resume`; completed cells are
 configuration fingerprint is verified. Use `--overwrite` instead to intentionally start over. TSP
 scores use a one-kilometer tolerance by default because the stored answers are integer distances
 and the public routing graph can change; adjust it with `--tsp-tolerance-km`.
+
+Every registry cell also writes an append-only, fsynced
+`OUTPUT_STEM.artifacts/RECORD_ID/BUDGET_ID/attempts/ATTEMPT_ID/trace.jsonl`, containing model responses,
+tool arguments,
+results, streamed candidate events, and incumbent updates. Its sibling `artifacts/` holds the actual
+content-addressed evidence, matrices, plans, and resume state. Runpod uploads these nested files as
+well as completed rows. Thus even a cell interrupted before its final JSONL row retains its latest
+successfully uploaded trace. Resume skips completed cells and retries unfinished cells from the
+prompt; it does not restore a mid-turn model session. Unique attempt directories preserve earlier
+uploaded traces even if the retry starts on a new Pod.
+
+`--tool-mode legacy` explicitly selects the old `search_locations`/`solve_current_problem` harness
+for reproduction only. Its results must not be pooled with `evaluation_protocol=live_registry_v1`.
+Fingerprints reject resuming checkpoints from a different tool mode.
 
 ## Deterministic fake chat
 

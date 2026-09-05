@@ -383,10 +383,15 @@ def solve_route_ortools(
             routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
     parameters = pywrapcp.DefaultRoutingSearchParameters()
     parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    bounded = max_time_seconds is not None and math.isfinite(max_time_seconds)
+    # Guided local search does not terminate by itself. An unlimited invocation
+    # uses descent to a local optimum, without imposing a hidden time budget.
     parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        if bounded
+        else routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
     )
-    if max_time_seconds is not None:
+    if max_time_seconds is not None and bounded:
         milliseconds = max(1, math.floor(max_time_seconds * 1_000))
         parameters.time_limit.seconds = milliseconds // 1_000
         parameters.time_limit.nanos = (milliseconds % 1_000) * 1_000_000
@@ -412,7 +417,7 @@ def solve_route_ortools(
         best_comparator_key=(),
         certificate={
             "solver": "ortools_routing",
-            "status": "bounded_solution",
+            "status": "bounded_solution" if bounded else "local_optimum",
             "objective": int(solution.ObjectiveValue()),
             "integer_scale": scale,
         },

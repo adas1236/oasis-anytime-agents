@@ -3,6 +3,7 @@
 from oasis.tools.evidence.access import IsochronesTool, ServiceMatrixTool, TravelMatrixTool
 from oasis.tools.evidence.construction import BuildCandidatesTool, BuildDemandTool
 from oasis.tools.evidence.health import DeriveHealthMeasureTool
+from oasis.tools.evidence.locations import InspectArtifactTool, MaterializeLocationsTool
 from oasis.tools.evidence.normalize import NormalizeArtifactTool
 from oasis.tools.evidence.overlay import OverlayReduceTool
 from oasis.tools.evidence.profile import ProfileArtifactTool
@@ -17,6 +18,8 @@ def evidence_tools() -> tuple[Tool, ...]:
         BuildDemandTool(),
         DeriveHealthMeasureTool(),
         IsochronesTool(),
+        InspectArtifactTool(),
+        MaterializeLocationsTool(),
         NormalizeArtifactTool(),
         OverlayReduceTool(),
         ProfileArtifactTool(),
@@ -29,7 +32,9 @@ __all__ = [
     "BuildCandidatesTool",
     "BuildDemandTool",
     "DeriveHealthMeasureTool",
+    "InspectArtifactTool",
     "IsochronesTool",
+    "MaterializeLocationsTool",
     "NormalizeArtifactTool",
     "OverlayReduceTool",
     "ProfileArtifactTool",

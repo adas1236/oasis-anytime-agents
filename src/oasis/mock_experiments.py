@@ -106,6 +106,7 @@ class ExperimentConfig:
     token_budgets: tuple[int | None, ...] = (None,)
     max_tool_calls: int | None = None
     resume: bool = False
+    tool_mode: str = "registry"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +132,13 @@ class BudgetPoint:
 
 @dataclass(slots=True)
 class AgentRun:
+    protocol: str = "legacy_mock_v1"
+    tool_names: list[str] = field(default_factory=list)
+    tool_spec_hash: str | None = None
+    failures: list[dict[str, Any]] = field(default_factory=list)
+    initial_input_tokens: int | None = None
+    artifacts_directory: str | None = None
+    agent_plan_found: bool = False
     answer_text: str | None = None
     prediction: dict[str, Any] | None = None
     baseline_prediction: dict[str, Any] | None = None
@@ -675,6 +683,11 @@ class OsrmMatrixStore:
 
         await self._region_matrix(region)
 
+    async def region_matrix(self, region: str) -> list[list[float]]:
+        """Read the cached directed road distances in meters without exposing mutable storage."""
+
+        return [list(row) for row in await self._region_matrix(region)]
+
     async def evaluate_route(self, region: str, locations: Sequence[Location]) -> dict[str, Any]:
         """Evaluate the prompt-order round trip used as the TSP baseline."""
 
@@ -751,6 +764,7 @@ def _incumbent_event(
         "tool_calls": clock.tool_calls,
         "source": source,
         "correct": _score(case, prediction, tolerance),
+        "objective_correct": _objective_score(case, prediction, tolerance),
         "prediction": prediction,
     }
 
@@ -947,7 +961,22 @@ async def _run_agent_case(
     config: ExperimentConfig,
     osrm: OsrmMatrixStore | None,
     budget: BudgetPoint | None = None,
+    *,
+    artifact_root: Path | None = None,
 ) -> AgentRun:
+    if config.tool_mode == "registry":
+        from oasis.registry_experiments import run_registry_case
+
+        selected_budget = budget or BudgetPoint(
+            "time-unlimited_tokens-unlimited", None, None, config.max_tool_calls
+        )
+        root = (
+            artifact_root
+            or _output_path(config).with_suffix(".artifacts")
+            / case.record_id.replace(":", "-")
+            / selected_budget.budget_id
+        )
+        return await run_registry_case(case, backend, config, osrm, selected_budget, root)
     # These imports avoid importing model runtimes until the wrapper has applied
     # CUDA_VISIBLE_DEVICES from --gpus.
     from oasis.llm.schemas import ChatMessage, ChatRole, ModelRequest, ToolDefinition
@@ -1172,6 +1201,17 @@ def _score(case: MockCase, prediction: dict[str, Any] | None, tolerance: float) 
     return abs(float(predicted_distance) - float(expected_distance)) <= tolerance
 
 
+def _objective_score(case: MockCase, prediction: dict[str, Any] | None, tolerance: float) -> bool:
+    """Score verified decisions, allowing optimal coverage with fewer than the site limit."""
+    if case.dataset is DatasetKind.MAX_COVERAGE and prediction is not None:
+        return (
+            isinstance(case.answer, dict)
+            and prediction.get("people_covered") == case.answer.get("people_covered")
+            and len(prediction.get("center_locations", [])) <= (case.centers_to_place or 0)
+        )
+    return _score(case, prediction, tolerance)
+
+
 def _expected_summary(case: MockCase) -> dict[str, Any]:
     if case.dataset is DatasetKind.MAX_COVERAGE and isinstance(case.answer, dict):
         return {
@@ -1353,6 +1393,10 @@ def _budget_grid(config: ExperimentConfig) -> tuple[BudgetPoint, ...]:
 
 def _config_payload(config: ExperimentConfig) -> dict[str, Any]:
     return {
+        "evaluation_protocol": "live_registry_v1"
+        if config.tool_mode == "registry"
+        else "legacy_mock_v1",
+        "tool_mode": config.tool_mode,
         "dataset": config.dataset,
         "data_root": str(config.data_root),
         "model_type": config.model_type,
@@ -1477,6 +1521,10 @@ def _build_summary(
             "cells": len(subset),
             "correct": correct,
             "accuracy": correct / len(subset),
+            "objective_accuracy": sum(
+                bool(r.get("objective_correct", r["correct"])) for r in subset
+            )
+            / len(subset),
             "errors": sum(result["error"] is not None for result in subset),
         }
     by_budget: dict[str, dict[str, Any]] = {}
@@ -1488,6 +1536,10 @@ def _build_summary(
             "cells": len(subset),
             "correct": correct,
             "accuracy": correct / len(subset),
+            "objective_accuracy": sum(
+                bool(r.get("objective_correct", r["correct"])) for r in subset
+            )
+            / len(subset),
             "errors": sum(result["error"] is not None for result in subset),
             "mean_total_model_tokens": statistics.fmean(
                 result["usage"]["total_tokens"] for result in subset
@@ -1516,6 +1568,12 @@ def _build_summary(
         "records": len(results),
         "correct": correct,
         "accuracy": correct / len(results) if results else 0.0,
+        "objective_accuracy": (
+            sum(bool(r.get("objective_correct", r["correct"])) for r in results) / len(results)
+            if results
+            else 0.0
+        ),
+        "agent_plan_cells": sum(bool(r.get("agent_plan_found")) for r in results),
         "errors": sum(result["error"] is not None for result in results),
         "mean_input_tokens": (
             statistics.fmean(result["usage"]["input_tokens"] for result in results)
@@ -1593,8 +1651,13 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     _write_summary(output_path, summary)
 
     tsp_cases = [case for case in all_loaded if case.dataset is DatasetKind.TSP]
+    if config.tool_mode == "registry" and not tsp_cases:
+        tsp_cases = load_dataset(DatasetKind.TSP, config.data_root / DATASET_FILES["tsp"])
     osrm = None
-    if any(case.dataset is DatasetKind.TSP for case, _ in pending_cells):
+    if pending_cells and (
+        config.tool_mode == "registry"
+        or any(case.dataset is DatasetKind.TSP for case, _ in pending_cells)
+    ):
         osrm = OsrmMatrixStore(
             endpoint=config.osrm_endpoint,
             cache_dir=config.osrm_cache,
@@ -1605,7 +1668,11 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         # OSRM evidence is static experiment setup, like loading model weights;
         # it is shared by every grid cell and excluded from per-cell wall budgets.
         for region in sorted(
-            {case.region for case, _ in pending_cells if case.dataset is DatasetKind.TSP}
+            {
+                case.region
+                for case, _ in pending_cells
+                if config.tool_mode == "registry" or case.dataset is DatasetKind.TSP
+            }
         ):
             await osrm.prepare_region(region)
 
@@ -1623,10 +1690,26 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                         f"({case.region}) {budget.budget_id}",
                         file=sys.stderr,
                     )
-                backend = shared_backend if shared_backend is not None else _fake_backend(case)
+                if shared_backend is not None:
+                    backend = shared_backend
+                elif config.tool_mode == "registry":
+                    from oasis.registry_experiments import RegistrySmokeBackend
+
+                    backend = RegistrySmokeBackend()
+                else:
+                    backend = _fake_backend(case)
                 case_started = time.monotonic()
                 try:
-                    run = await _run_agent_case(case, backend, config, osrm, budget)
+                    run = await _run_agent_case(
+                        case,
+                        backend,
+                        config,
+                        osrm,
+                        budget,
+                        artifact_root=output_path.with_suffix(".artifacts")
+                        / case.record_id.replace(":", "-")
+                        / budget.budget_id,
+                    )
                 except Exception as exc:
                     run = AgentRun(
                         terminal_reason="error",
@@ -1636,6 +1719,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     if shared_backend is None:
                         await backend.close()
                 correct = _score(case, run.prediction, config.tsp_tolerance_km)
+                objective_correct = _objective_score(case, run.prediction, config.tsp_tolerance_km)
                 total_elapsed = time.monotonic() - case_started
                 consumed_budget = {
                     "wall_time_seconds": run.budget_elapsed_seconds,
@@ -1648,6 +1732,19 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     "usage_complete": run.usage_complete,
                 }
                 result = {
+                    "evaluation_protocol": "live_registry_v1"
+                    if config.tool_mode == "registry"
+                    else "legacy_mock_v1",
+                    "tool_names": run.tool_names,
+                    "tool_spec_hash": run.tool_spec_hash,
+                    "initial_input_tokens": run.initial_input_tokens,
+                    "failures": run.failures,
+                    "agent_plan_found": run.agent_plan_found,
+                    "artifacts_directory": (
+                        str(Path(run.artifacts_directory).relative_to(output_path.parent))
+                        if run.artifacts_directory is not None
+                        else None
+                    ),
                     "experiment_fingerprint": fingerprint,
                     "cell_status": "complete",
                     "record_id": case.record_id,
@@ -1664,6 +1761,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     "prediction_source": run.prediction_source,
                     "incumbent_timeline": run.incumbent_timeline,
                     "correct": correct,
+                    "objective_correct": objective_correct,
                     "answer_text": run.answer_text,
                     "tool_calls": run.calls,
                     "usage": {
@@ -1732,6 +1830,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument(
+        "--tool-mode",
+        choices=["registry", "legacy"],
+        default="registry",
+        help=(
+            "Use the live registry with dataset providers (default); "
+            "legacy reproduces the old two-tool smoke harness."
+        ),
+    )
+    parser.add_argument(
         "--model-type",
         "--backend",
         dest="model_type",
@@ -1788,7 +1895,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=768,
         help="Per-generation output cap; the aggregate grid cap is --token-budgets.",
     )
-    parser.add_argument("--max-tool-rounds", type=int, default=4)
+    parser.add_argument("--max-tool-rounds", type=int, default=20)
     parser.add_argument(
         "--max-tool-calls",
         default="unlimited",
@@ -1894,6 +2001,7 @@ def _validated_config(
         if len(set(gpu_parts)) != len(gpu_parts):
             parser.error("--gpus contains a duplicate GPU ID")
     return ExperimentConfig(
+        tool_mode=namespace.tool_mode,
         dataset=namespace.dataset,
         data_root=namespace.data_root,
         model_type=namespace.model_type,

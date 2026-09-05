@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -93,6 +94,54 @@ async def test_mobile_vaccination_demo_improves_and_independently_scores(tmp_pat
     assert result.overall_metrics["served_value"] == 8.0
     assert plugin.compare(best, baseline) is Comparison.BETTER
     assert result.scenario_metrics["normal"]["coverage"] == pytest.approx(8 / 15)
+
+
+@pytest.mark.asyncio
+async def test_unlimited_ortools_and_model_visible_resume_artifact(tmp_path: Path) -> None:
+    store, problem_id, plan_id, _ = publish_route_problem(tmp_path, type_id=RouteProblemType.TSP)
+    registry = create_tool_registry(discover_entry_points=False)
+    unlimited = ToolContext(
+        run_id="unlimited-routing",
+        artifact_store=store,
+        deadline_monotonic=math.inf,
+        cancellation=CancellationToken(),
+        seed=42,
+    )
+    solved = await invoke_tool(
+        registry.get("improve"),
+        {
+            "problem_artifact_id": problem_id,
+            "strategy": "ortools_routing",
+        },
+        unlimited,
+    )
+    assert solved.error is None
+    assert solved.candidate is not None
+    partial = await invoke_tool(
+        registry.get("improve"),
+        {
+            "problem_artifact_id": problem_id,
+            "starting_plan_artifact_id": plan_id,
+            "strategy": "exact_enumeration",
+            "max_candidates": 1,
+        },
+        unlimited,
+    )
+    assert partial.error is None
+    token_id = partial.metrics["resume_token_artifact_id"]
+    assert isinstance(token_id, str) and token_id in partial.model_summary()
+    resumed = await invoke_tool(
+        registry.get("improve"),
+        {
+            "problem_artifact_id": problem_id,
+            "strategy": "exact_enumeration",
+            "resume_token_artifact_id": token_id,
+            "max_candidates": 1000,
+        },
+        unlimited,
+    )
+    assert resumed.error is None
+    assert resumed.metrics["complete"]
 
 
 @pytest.mark.asyncio

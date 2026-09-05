@@ -6,7 +6,7 @@ on:
       image_tag:
         description: GHCR tag used by infra/runpod/experiment.toml
         required: true
-        default: runpod-eval-v4
+        default: runpod-eval-v5
         type: string
 
 permissions:

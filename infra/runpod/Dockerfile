@@ -53,4 +53,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # worker after Runpod starts the container.
 RUN python -c "import boto3, geopandas, ortools, rasterio, torch, torchvision, transformers; from transformers import AutoModelForMultimodalLM, Gemma4Config, Gemma4Processor; assert torch.__version__.startswith('2.8.'), torch.__version__; assert torchvision.__version__.startswith('0.23.'), torchvision.__version__; assert AutoModelForMultimodalLM._model_mapping[Gemma4Config].__name__ == 'Gemma4ForConditionalGeneration'; print({'torch': torch.__version__, 'torchvision': torchvision.__version__, 'cuda': torch.version.cuda, 'transformers': transformers.__version__, 'gemma4_processor': Gemma4Processor.__name__})"
 
+# Exercise every dataset through the actual registry without a GPU, model
+# download, geocoding network call, or credentials. Fail the build on bad wiring.
+RUN python -m oasis.registry_smoke --rows 1 \
+      --osrm-cache /opt/oasis/osrm-cache --output /tmp/oasis-registry-build-check
+
 CMD ["python", "-m", "oasis.runpod_experiments", "worker"]

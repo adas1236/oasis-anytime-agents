@@ -201,6 +201,25 @@ def _place_provider(context: ToolContext) -> PlaceResolver:
     return provider
 
 
+def _candidate_preview(groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose enough ranked identities to select candidates without overflowing the envelope."""
+
+    preview: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        for candidate in group["candidates"]:
+            item = {
+                "query_index": index,
+                "provider_id": candidate["provider_id"],
+                "display_name": candidate["display_name"],
+                "rank": candidate["rank"],
+                "metadata_fields": sorted(candidate.get("provider_metadata", {})),
+            }
+            if len(json.dumps([*preview, item], ensure_ascii=False).encode()) > 4_000:
+                return {"candidates": preview, "preview_truncated": True}
+            preview.append(item)
+    return {"candidates": preview, "preview_truncated": False}
+
+
 def _resolution_artifact(
     context: ToolContext,
     *,
@@ -235,7 +254,7 @@ def _resolution_artifact(
 class ResolveAreaTool:
     """Return ranked place/area candidates without silently selecting one."""
 
-    version = "1.0.0"
+    version = "1.1.0"
     spec = ToolSpec(
         name="resolve_area",
         version=version,
@@ -295,6 +314,7 @@ class ResolveAreaTool:
                 "candidate_count": len(candidates),
                 "ambiguous": result.ambiguous,
                 "resolution": reference.id,
+                **_candidate_preview([{"candidates": list(candidates)}]),
             },
             artifacts=(reference,),
             metrics=output.model_dump(mode="json"),
@@ -304,7 +324,7 @@ class ResolveAreaTool:
 class ResolveLocationsTool:
     """Resolve several independent locations while retaining per-query rankings."""
 
-    version = "1.0.0"
+    version = "1.1.0"
     spec = ToolSpec(
         name="resolve_locations",
         version=version,
@@ -356,6 +376,7 @@ class ResolveLocationsTool:
                 raw_results.append(
                     {
                         "query_index": index,
+                        "query": query,
                         "candidate_count": len(candidates),
                         "ambiguous": result.ambiguous,
                         "candidates": cast(list[JsonValue], candidates),
@@ -392,6 +413,7 @@ class ResolveLocationsTool:
                 "result_count": result_count,
                 "ambiguous_query_count": ambiguous_count,
                 "resolution": reference.id,
+                **_candidate_preview(cast(list[dict[str, Any]], raw_results)),
             },
             artifacts=(reference,),
             metrics=output.model_dump(mode="json"),

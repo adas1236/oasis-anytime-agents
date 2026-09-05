@@ -67,11 +67,74 @@ def test_plan_reuses_exact_selection_for_every_budget(tmp_path: Path) -> None:
         assert all(len(job["record_ids"]) == 12 for job in jobs)
 
 
-def test_tracked_full_plan_is_27_jobs_with_500_rows_each() -> None:
+def test_tracked_full_plan_is_27_registry_jobs_with_200_rows_each() -> None:
     plan = build_plan(EXAMPLE_CONFIG)
 
     assert len(plan["jobs"]) == 27
-    assert {selection["rows"] for selection in plan["selections"].values()} == {500}
+    assert {selection["rows"] for selection in plan["selections"].values()} == {200}
+    assert plan["experiment"]["tool_mode"] == "registry"
+    assert plan["experiment"]["max_tool_rounds"] == 20
+    assert all(job["pod_payload"]["env"]["OASIS_TOOL_MODE"] == "registry" for job in plan["jobs"])
+
+
+def test_tracked_plan_settings_reach_evaluator_for_all_27_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oasis.mock_experiments import _validated_config, build_parser
+
+    plan = build_plan(EXAMPLE_CONFIG)
+    observed = set()
+    for job in plan["jobs"]:
+        assert job["pod_payload"]["image"].endswith(":runpod-eval-v5")
+        with monkeypatch.context() as environment:
+            for name, value in job["pod_payload"]["env"].items():
+                environment.setenv(name, value)
+            arguments = _runner_arguments(tmp_path / "results.jsonl")
+            parser = build_parser()
+            config = _validated_config(parser.parse_args(arguments[3:]), parser)
+        assert config.tool_mode == "registry"
+        assert config.max_tool_rounds == 20
+        assert config.max_generated_tokens == 1536
+        assert config.osrm_cache_only
+        assert config.seed == 42 and config.limit == 200
+        assert config.gpus == "auto"
+        assert config.expected_selection_digest == job["selection_digest"]
+        observed.add((config.dataset, config.time_budgets_seconds[0], config.token_budgets[0]))
+    assert observed == {
+        (dataset, seconds, tokens)
+        for dataset in ("max_coverage", "minimum_facility", "tsp")
+        for seconds in (30, 60, None)
+        for tokens in (32_000, 256_000, None)
+    }
+
+
+def test_s3_sync_uploads_nested_traces_but_skips_unchanged_and_temporary_files(tmp_path: Path):
+    sync = runpod_module.ArtifactSync(tmp_path, "")
+    uploaded = []
+
+    class Client:
+        def upload_file(self, filename, bucket, key):
+            uploaded.append(key)
+
+    sync.client = Client()
+    sync.prefix = "experiment"
+    nested = tmp_path / "results.artifacts/case/budget"
+    nested.mkdir(parents=True)
+    trace = nested / "trace.jsonl"
+    trace.write_text("{}\n")
+    staging = nested / ".artifact-write"
+    staging.mkdir()
+    (staging / "metadata.json").write_text("{}")
+    (nested / "metadata.json.tmp").write_text("{}")
+    (nested / "alias").symlink_to(trace)
+    sync.upload()
+    assert uploaded == ["experiment/results.artifacts/case/budget/trace.jsonl"]
+    sync.upload()
+    assert len(uploaded) == 1
+    trace.write_text("{}\n{}\n")
+    sync.upload()
+    assert len(uploaded) == 2
 
 
 def test_plan_shards_without_changing_selected_rows_and_overrides_gpus(
@@ -102,8 +165,7 @@ def test_plan_shards_without_changing_selected_rows_and_overrides_gpus(
     assert all(job["pod_payload"]["gpu"]["id"] == "NVIDIA RTX A6000" for job in plan["jobs"])
     assert all(job["pod_payload"]["env"]["OASIS_EXPECTED_GPU_COUNT"] == "4" for job in plan["jobs"])
     assert all(
-        job["pod_payload"]["env"]["OASIS_HOLD_AFTER_COMPLETION"] == "1"
-        for job in plan["jobs"]
+        job["pod_payload"]["env"]["OASIS_HOLD_AFTER_COMPLETION"] == "1" for job in plan["jobs"]
     )
 
 
@@ -510,15 +572,25 @@ def test_evaluation_worker_runs_subprocess_and_reports_durable_summary(
 
     assert worker_main() == 0
 
-    local_dir = (
-        tmp_path / "results" / plan["plan_id"] / plan["jobs"][0]["job_id"]
-    )
+    local_dir = tmp_path / "results" / plan["plan_id"] / plan["jobs"][0]["job_id"]
     status = json.loads((local_dir / "job-status.json").read_text(encoding="utf-8"))
     assert status["status"] == "complete"
     assert status["runner_exit_code"] == 0
     assert status["evaluation_summary"]["selected_records"] == 1
     assert status["evaluation_summary"]["completed_cells"] == 1
     assert status["evaluation_summary"]["errors"] == 0
+    record = json.loads((local_dir / "results.jsonl").read_text().splitlines()[0])
+    from oasis.tools import create_tool_registry
+
+    expected_tools = [
+        definition.name
+        for definition in create_tool_registry(discover_entry_points=False).model_definitions()
+    ]
+    assert record["evaluation_protocol"] == "live_registry_v1"
+    assert record["tool_names"] == expected_tools
+    assert len(expected_tools) == 21
+    assert "solve_current_problem" not in record["tool_names"]
+    assert record["agent_plan_found"]
     events = capsys.readouterr().out
     assert "oasis_worker_finished" in events
     assert '"completed_cells": 1' in events

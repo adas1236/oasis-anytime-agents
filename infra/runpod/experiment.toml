@@ -1,16 +1,19 @@
 [experiment]
-name = "oasis-500-row-grid"
+name = "oasis-registry-200-row-grid"
 data_root = "../../data"
 datasets = ["max_coverage", "minimum_facility", "tsp"]
-rows_per_dataset = 500
+rows_per_dataset = 200
 seed = 42
 
 # One shard gives 27 logical Pods. Increase this only when a condition needs to
 # be split across multiple Pods to meet a deadline; all budget cells retain the
-# identical ordered 500-row sample.
+# identical ordered 200-row sample.
 shards_per_condition = 1
 time_budgets = ["30s", "60s", "unlimited"]
-token_budgets = ["2k", "8k", "unlimited"]
+# Provisional: the full registry is charged on every model turn. Recalibrate
+# these aggregate input+output budgets with a small real-model pilot before a grid.
+token_budgets = ["32k", "256k", "unlimited"]
+tool_mode = "registry"
 
 model_type = "transformers"
 profile = "gemma4_e2b_it"
@@ -21,8 +24,8 @@ dtype = "bfloat16"
 quantization = "none"
 attention_backend = "sdpa"
 thinking = true
-max_generated_tokens = 768
-max_tool_rounds = 4
+max_generated_tokens = 1536
+max_tool_rounds = 20
 max_tool_calls = "unlimited"
 model_call_timeout = "unlimited"
 tsp_tolerance_km = 1.0
@@ -35,7 +38,7 @@ osrm_cache_only = true
 [runpod]
 # Build and push this exact image name before launching. Make the GHCR package
 # public, or set container_registry_auth_id below for a private package.
-image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v4"
+image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v5"
 
 # Use exactly one GPU type for controlled timing comparisons. Multiple entries
 # mean acceptable alternatives chosen for availability, not heterogeneous GPUs.
@@ -67,4 +70,7 @@ local_root = "/workspace/oasis-results"
 # AWS credentials as Runpod-secret references in [runpod.env]. An empty value
 # leaves results on the Pod/network volume and prevents automatic off-Pod backup.
 s3_uri = "s3://oasis-anytime-agent/oasis-anytime-agents"
-upload_interval_seconds = 60
+# Each completed row is already fsynced locally. Upload frequent snapshots so
+# In-progress tool traces and incumbents are uploaded too. An early stop can
+# lose changes since the last successful upload; completed cells are resumable.
+upload_interval_seconds = 15

@@ -192,6 +192,7 @@ def _job_environment(
         "OASIS_LIMIT": str(shard["limit"]),
         "OASIS_SELECTION_DIGEST": str(shard["selection_digest"]),
         "OASIS_MODEL_TYPE": str(experiment["model_type"]),
+        "OASIS_TOOL_MODE": str(experiment["tool_mode"]),
         "OASIS_MODEL_PROFILE": str(experiment["profile"]),
         "OASIS_PROBE_ONLY": "1" if experiment["probe_only"] else "0",
         "OASIS_IMAGE": image,
@@ -340,6 +341,7 @@ def build_plan(config_path: Path, overrides: PlanOverrides | None = None) -> dic
         "time_budgets": time_budgets,
         "token_budgets": token_budgets,
         "model_type": model_type,
+        "tool_mode": str(experiment_raw.get("tool_mode", "registry")),
         "profile": str(experiment_raw.get("profile", "gemma4_e2b_it")),
         "probe_only": (
             overrides.probe_only
@@ -356,7 +358,7 @@ def build_plan(config_path: Path, overrides: PlanOverrides | None = None) -> dic
             experiment_raw.get("max_generated_tokens", 768), "max_generated_tokens"
         ),
         "max_tool_rounds": _positive_int(
-            experiment_raw.get("max_tool_rounds", 4), "max_tool_rounds"
+            experiment_raw.get("max_tool_rounds", 20), "max_tool_rounds"
         ),
         "max_tool_calls": str(experiment_raw.get("max_tool_calls", "unlimited")),
         "model_call_timeout": str(experiment_raw.get("model_call_timeout", "unlimited")),
@@ -367,6 +369,8 @@ def build_plan(config_path: Path, overrides: PlanOverrides | None = None) -> dic
         ),
         "tsp_tolerance_km": float(experiment_raw.get("tsp_tolerance_km", 1.0)),
     }
+    if experiment["tool_mode"] not in {"registry", "legacy"}:
+        raise ValueError("experiment.tool_mode must be registry or legacy")
     image = str(runpod_raw.get("image", "")).strip()
     if not image:
         raise ValueError("runpod.image is required")
@@ -911,6 +915,8 @@ def _runner_arguments(output: Path) -> list[str]:
         "oasis.run_mock_experiment",
         "--model-type",
         _required_env("OASIS_MODEL_TYPE"),
+        "--tool-mode",
+        os.environ.get("OASIS_TOOL_MODE", "registry"),
         "--profile",
         _required_env("OASIS_MODEL_PROFILE"),
         "--dataset",
@@ -978,6 +984,7 @@ class ArtifactSync:
         self.bucket = ""
         self.prefix = ""
         self.client: Any = None
+        self._uploaded: dict[Path, tuple[int, int]] = {}
         if self.s3_uri:
             self.bucket, self.prefix = _s3_location(self.s3_uri)
             try:
@@ -1015,9 +1022,20 @@ class ArtifactSync:
     def upload(self) -> None:
         if not self.enabled:
             return
-        for path in self.local_dir.iterdir():
-            if path.is_file() and not path.name.endswith((".tmp", ".download")):
-                self.client.upload_file(str(path), self.bucket, self._key(path))
+        for path in self.local_dir.rglob("*"):
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or any(part.startswith(".") for part in path.relative_to(self.local_dir).parts)
+                or path.name.endswith((".tmp", ".download"))
+            ):
+                continue
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if self._uploaded.get(path) == signature:
+                continue
+            self.client.upload_file(str(path), self.bucket, self._key(path))
+            self._uploaded[path] = signature
 
 
 def _gpu_inventory() -> dict[str, Any]:

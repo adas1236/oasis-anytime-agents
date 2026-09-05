@@ -33,6 +33,7 @@ DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
 
 def _config(tmp_path: Path) -> ExperimentConfig:
     return ExperimentConfig(
+        tool_mode="legacy",
         dataset="max_coverage",
         data_root=DATA_ROOT,
         model_type="fake",

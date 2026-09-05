@@ -7,7 +7,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from oasis.artifacts import put_json
+from oasis.artifacts import put_json, read_json
 from oasis.problems.location_allocation import load_problem_data
 from oasis.problems.protocols import Deadline
 from oasis.problems.registry import ProblemRegistry, create_builtin_problem_registry
@@ -50,11 +50,24 @@ class ImproveInput(BaseModel):
     strategy: SearchStrategy = SearchStrategy.ADD_SWAP
     max_candidates: int = Field(default=1_000, ge=1, le=1_000_000)
     resume_token: SearchResumeToken | None = None
+    resume_token_artifact_id: str | None = Field(default=None, pattern=r"^sha256-[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def one_starting_state(self) -> Self:
-        if self.starting_plan_artifact_id is not None and self.resume_token is not None:
-            raise ValueError("starting_plan_artifact_id and resume_token are mutually exclusive")
+        if (
+            sum(
+                value is not None
+                for value in (
+                    self.starting_plan_artifact_id,
+                    self.resume_token,
+                    self.resume_token_artifact_id,
+                )
+            )
+            > 1
+        ):
+            raise ValueError(
+                "starting_plan_artifact_id and resume_token or its artifact are mutually exclusive"
+            )
         return self
 
 
@@ -69,18 +82,20 @@ class ImproveOutput(BaseModel):
     best_plan_artifact_id: str
     best_scorecard_artifact_id: str
     bound_artifact_id: str | None = None
+    resume_token_artifact_id: str | None = None
 
 
 class ImproveTool:
     """Search one bounded slice while streaming only independently verified improvements."""
 
-    version = "1.1.0"
+    version = "1.2.0"
     spec = ToolSpec(
         name="improve",
         version=version,
         description=(
             "Run a registered location or routing improvement strategy, streaming every "
-            "independently rescored feasible improvement and any verified search bound."
+            "independently rescored feasible improvement and any verified search bound. "
+            "Continue partial search with its returned resume_token_artifact_id."
         ),
         input_schema=ImproveInput.model_json_schema(),
         output_schema=ImproveOutput.model_json_schema(),
@@ -140,8 +155,12 @@ class ImproveTool:
             invalid(f"invalid problem: {report.issues[0].message}")
         next_index = 0
         plan_parent = None
-        if request.resume_token is not None:
-            token = request.resume_token
+        token = request.resume_token
+        if request.resume_token_artifact_id is not None:
+            token = SearchResumeToken.model_validate(
+                read_json(context.artifact_store, request.resume_token_artifact_id)
+            )
+        if token is not None:
             if token.problem_hash != problem.problem_hash or token.strategy is not request.strategy:
                 invalid("resume token does not belong to this problem and strategy")
             incumbent = token.incumbent
@@ -308,12 +327,23 @@ class ImproveTool:
             )
             sequence += 1
         resume = None
+        resume_ref = None
         if not complete:
             resume = SearchResumeToken(
                 problem_hash=problem.problem_hash,
                 strategy=request.strategy,
                 next_index=next_index,
                 incumbent=incumbent,
+            )
+            resume_ref = put_json(
+                context.artifact_store,
+                resume.model_dump(mode="json"),
+                kind=ArtifactKind.JSON_SPECIFICATION,
+                units="unitless",
+                provenance=decision_provenance(
+                    self.spec.name, self.version, (problem_ref, plan_ref), {"role": "search_resume"}
+                ),
+                data_schema={"type": "SearchResumeToken", "version": "1.0.0"},
             )
         output = ImproveOutput(
             problem_hash=problem.problem_hash,
@@ -324,6 +354,7 @@ class ImproveTool:
             best_plan_artifact_id=plan_ref.id,
             best_scorecard_artifact_id=score_ref.id,
             bound_artifact_id=bound_ref.id if bound_ref is not None else None,
+            resume_token_artifact_id=resume_ref.id if resume_ref is not None else None,
         )
         status = ToolResultStatus.COMPLETE if complete else ToolResultStatus.PARTIAL
         yield ToolEvent(
@@ -341,7 +372,7 @@ class ImproveTool:
                 },
                 artifacts=tuple(
                     reference
-                    for reference in (plan_ref, score_ref, bound_ref)
+                    for reference in (plan_ref, score_ref, bound_ref, resume_ref)
                     if reference is not None
                 ),
                 metrics=output.model_dump(mode="json"),

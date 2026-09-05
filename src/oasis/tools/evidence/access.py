@@ -61,6 +61,7 @@ from oasis.tools.protocols import ToolContext
 class TravelStrategy(StrEnum):
     EUCLIDEAN = "euclidean"
     GEODESIC = "geodesic"
+    HAVERSINE = "haversine"
     GRAPH_SHORTEST_PATH = "graph_shortest_path"
     ROUTED_PROVIDER = "routed_provider"
 
@@ -323,12 +324,13 @@ def _validate_graph_weights(graph: nx.Graph[str], weight_field: str) -> None:
 class TravelMatrixTool:
     """Build local or provider-routed labeled travel matrices."""
 
-    version = "1.1.0"
+    version = "1.2.0"
     spec = ToolSpec(
         name="travel_matrix",
         version=version,
         description=(
-            "Build a labeled travel matrix using projected Euclidean, WGS84 geodesic, directed "
+            "Build a labeled travel matrix using projected Euclidean, WGS84 geodesic, spherical "
+            "haversine (Earth radius 6371.0088 km), directed "
             "graph shortest paths, or an explicitly configured routing provider."
         ),
         input_schema=TravelMatrixInput.model_json_schema(),
@@ -362,6 +364,24 @@ class TravelMatrixTool:
             values = _euclidean(origins, destinations, request.output_units)
         elif request.strategy is TravelStrategy.GEODESIC:
             values = _geodesic(origins, destinations, request.output_units)
+        elif request.strategy is TravelStrategy.HAVERSINE:
+            left = origins.to_crs("EPSG:4326")
+            right = destinations.to_crs("EPSG:4326")
+            _validate_lon_lat(left)
+            _validate_lon_lat(right)
+            if request.output_units not in {"meters", "kilometers"}:
+                invalid("haversine output_units must be meters or kilometers")
+            lat1 = np.radians(left.geometry.y.to_numpy())[:, None]
+            lat2 = np.radians(right.geometry.y.to_numpy())[None, :]
+            lon1 = np.radians(left.geometry.x.to_numpy())[:, None]
+            lon2 = np.radians(right.geometry.x.to_numpy())[None, :]
+            haversine = (
+                np.sin((lat2 - lat1) / 2) ** 2
+                + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+            )
+            values = 2 * 6_371_008.8 * np.arcsin(np.sqrt(np.clip(haversine, 0, 1)))
+            if request.output_units == "kilometers":
+                values /= 1_000
         elif request.strategy is TravelStrategy.GRAPH_SHORTEST_PATH:
             assert request.graph_artifact_id is not None
             assert request.origin_graph_node_field is not None
