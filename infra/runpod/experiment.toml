@@ -14,6 +14,9 @@ token_budgets = ["2k", "8k", "unlimited"]
 
 model_type = "transformers"
 profile = "gemma4_e2b_it"
+# Set by `plan --probe-only` for image/startup benchmarks. Probe jobs verify
+# Python, Torch/CUDA, visible GPUs, and S3 without loading a model.
+probe_only = false
 dtype = "bfloat16"
 quantization = "none"
 attention_backend = "sdpa"
@@ -29,7 +32,7 @@ osrm_cache_only = false
 [runpod]
 # Build and push this exact image name before launching. Make the GHCR package
 # public, or set container_registry_auth_id below for a private package.
-image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v1"
+image = "ghcr.io/adas1236/oasis-anytime-agents:runpod-eval-v2"
 
 # Use exactly one GPU type for controlled timing comparisons. Multiple entries
 # mean acceptable alternatives chosen for availability, not heterogeneous GPUs.

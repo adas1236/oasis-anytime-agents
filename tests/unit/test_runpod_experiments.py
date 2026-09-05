@@ -10,8 +10,11 @@ from oasis.runpod_experiments import (
     PlanOverrides,
     _runner_arguments,
     build_plan,
+    cost_report,
     launch_plan,
     load_plan,
+    stop_pods,
+    worker_main,
 )
 
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
@@ -94,8 +97,60 @@ def test_plan_shards_without_changing_selected_rows_and_overrides_gpus(
         ]
         assert shard_ids == selection["record_ids"]
         assert [shard["limit"] for shard in selection["shards"]] == [6, 5]
-    assert all(job["pod_payload"]["gpuCount"] == 4 for job in plan["jobs"])
+    assert all(job["pod_payload"]["gpu"]["count"] == 4 for job in plan["jobs"])
+    assert all(job["pod_payload"]["gpu"]["id"] == "NVIDIA RTX A6000" for job in plan["jobs"])
     assert all(job["pod_payload"]["env"]["OASIS_EXPECTED_GPU_COUNT"] == "4" for job in plan["jobs"])
+
+
+def test_plan_uses_runpod_v2_payload_and_requires_one_gpu_type(tmp_path: Path) -> None:
+    plan = build_plan(
+        _write_config(tmp_path),
+        PlanOverrides(time_budgets="unlimited", token_budgets="unlimited"),
+    )
+
+    payload = plan["jobs"][0]["pod_payload"]
+    assert payload["image"] == "ghcr.io/example/oasis:test"
+    assert payload["cloud"] == "SECURE"
+    assert payload["disk"] == 60
+    assert payload["gpu"] == {
+        "id": "NVIDIA GeForce RTX 5090",
+        "count": 1,
+        "minVcpuCountPerGpu": 4,
+        "minRamPerGpu": 16,
+    }
+    assert payload["mounts"] == {"persistent": {"size": 40, "path": "/workspace"}}
+    assert "imageName" not in payload
+    assert "gpuTypeIds" not in payload
+
+    with pytest.raises(ValueError, match="exactly one gpu_type"):
+        build_plan(
+            _write_config(tmp_path),
+            PlanOverrides(gpu_types=("NVIDIA RTX A5000", "NVIDIA RTX A6000")),
+        )
+
+
+def test_probe_plan_has_distinct_identity_and_worker_environment(tmp_path: Path) -> None:
+    normal = build_plan(
+        _write_config(tmp_path),
+        PlanOverrides(time_budgets="unlimited", token_budgets="unlimited"),
+    )
+    probe = build_plan(
+        _write_config(tmp_path),
+        PlanOverrides(
+            rows=1,
+            time_budgets="unlimited",
+            token_budgets="unlimited",
+            probe_only=True,
+        ),
+    )
+
+    assert probe["plan_id"] != normal["plan_id"]
+    assert probe["experiment"]["probe_only"] is True
+    assert all(job["pod_payload"]["env"]["OASIS_PROBE_ONLY"] == "1" for job in probe["jobs"])
+    assert all(
+        job["pod_payload"]["env"]["OASIS_IMAGE"] == "ghcr.io/example/oasis:test"
+        for job in probe["jobs"]
+    )
 
 
 def test_plan_refuses_literal_secrets(tmp_path: Path) -> None:
@@ -183,7 +238,13 @@ def test_executed_launch_checkpoints_each_pod_and_is_idempotent(
             assert method == "POST"
             assert path == "/pods"
             calls.append(path)
-            return {"id": f"pod-{len(calls)}", "desiredStatus": "RUNNING"}
+            return {
+                "id": f"pod-{len(calls)}",
+                "status": "PROVISIONING",
+                "cost": 0.74,
+                "createdAt": "2026-09-05T01:00:00Z",
+                "startedAt": None,
+            }
 
     monkeypatch.setattr(runpod_module, "RunpodApi", FakeRunpodApi)
     monkeypatch.setenv("RUNPOD_API_KEY", "test-api-key")
@@ -210,6 +271,146 @@ def test_executed_launch_checkpoints_each_pod_and_is_idempotent(
         == 0
     )
     assert len(calls) == 2
+
+
+def test_stop_checkpoints_cost_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "plan_fingerprint": "fingerprint",
+                "pods": {
+                    "job-1": {
+                        "pod_id": "pod-1",
+                        "status": "RUNNING",
+                        "cost_per_hour": 0.72,
+                        "created_at": "2026-09-05T01:00:00+00:00",
+                        "stopped_at": None,
+                        "terminated_at": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, str, object]] = []
+
+    class FakeRunpodApi:
+        def __init__(self, api_key: str, base_url: str) -> None:
+            assert api_key == "test-api-key"
+
+        def request(self, method: str, path: str, payload: object = None) -> object:
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {"id": "pod-1", "status": "RUNNING"}
+            return {"id": "pod-1", "status": "EXITED", "cost": 0.0}
+
+    monkeypatch.setattr(runpod_module, "RunpodApi", FakeRunpodApi)
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-api-key")
+
+    assert stop_pods(state_path=state_path, execute=True) == 0
+    saved = json.loads(state_path.read_text(encoding="utf-8"))["pods"]["job-1"]
+    assert saved["status"] == "EXITED"
+    assert saved["stopped_at"] is not None
+    assert isinstance(saved["estimated_compute_cost_usd"], float)
+    assert calls == [
+        ("GET", "/pods/pod-1", None),
+        ("POST", "/pods/pod-1/action", {"action": "stop"}),
+    ]
+
+    assert stop_pods(state_path=state_path, execute=True) == 0
+    assert len(calls) == 2
+
+
+def test_cost_report_combines_state_and_downloaded_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "plan_id": "plan-1",
+                "pods": {
+                    "job-1": {
+                        "pod_id": "pod-1",
+                        "status": "EXITED",
+                        "cost_per_hour": 0.6,
+                        "created_at": "2026-09-05T01:00:00Z",
+                        "stopped_at": "2026-09-05T01:02:00Z",
+                        "terminated_at": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_dir = tmp_path / "results" / "plan-1" / "job-1"
+    status_dir.mkdir(parents=True)
+    (status_dir / "job-status.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "mode": "probe",
+                "image": "ghcr.io/example/oasis:test",
+                "container_started_at": "2026-09-05T01:01:30Z",
+                "started_at": "2026-09-05T01:01:35Z",
+                "finished_at": "2026-09-05T01:01:40Z",
+                "elapsed_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cost_report(state_path=state_path, results_root=tmp_path / "results") == 0
+    report = json.loads(capsys.readouterr().out)
+    row = report["jobs"][0]
+    assert row["image_pull_and_container_start_seconds"] == 90.0
+    assert row["worker_setup_seconds"] == 5.0
+    assert row["completion_to_stop_seconds"] == 20.0
+    assert row["billed_seconds_estimate"] == 120.0
+    assert row["estimated_compute_cost_usd"] == 0.02
+    assert report["summary"]["complete"] is True
+
+
+def test_probe_worker_records_hardware_without_starting_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    environment = {
+        "OASIS_PLAN_ID": "probe-plan",
+        "OASIS_JOB_ID": "probe-job",
+        "OASIS_PROBE_ONLY": "1",
+        "OASIS_EXPECTED_GPU_COUNT": "1",
+        "OASIS_RESULTS_ROOT": str(tmp_path),
+        "OASIS_RESULTS_S3_URI": "",
+        "OASIS_SELECTION_DIGEST": "a" * 64,
+        "OASIS_IMAGE": "ghcr.io/example/oasis:test",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        runpod_module,
+        "_gpu_inventory",
+        lambda: {
+            "pod_id": "pod-1",
+            "torch_version": "2.8.0+cu128",
+            "cuda_runtime": "12.8",
+            "cuda_visible_devices": "0",
+            "devices": [{"index": 0, "name": "test GPU"}],
+        },
+    )
+
+    assert worker_main() == 0
+    status = json.loads(
+        (tmp_path / "probe-plan" / "probe-job" / "job-status.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "complete"
+    assert status["mode"] == "probe"
+    assert status["visible_gpu_count"] == 1
+    assert not (tmp_path / "probe-plan" / "probe-job" / "results.jsonl").exists()
+    assert "oasis_worker_finished" in capsys.readouterr().out
 
 
 def test_worker_arguments_include_selection_guard_and_auto_gpus(
