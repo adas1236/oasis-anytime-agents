@@ -34,7 +34,7 @@ from oasis.providers.models import (
 )
 from oasis.registry_experiments import RegistrySession, RegistrySmokeBackend, system_prompt
 from oasis.schemas import Plan
-from oasis.tools import CancellationToken, create_tool_registry
+from oasis.tools import CancellationToken, create_public_tool_registry
 from unit.test_mock_experiments import DATA_ROOT, _config
 
 
@@ -78,9 +78,9 @@ async def test_real_registry_end_to_end_and_prompt_only_model_input(tmp_path: Pa
     assert result.agent_plan_found
     assert result.terminal_reason == "completed"
     assert _score(case, result.prediction, 1)
-    assert result.protocol == "live_registry_v1"
+    assert result.protocol == "live_registry_v2"
     assert result.tool_names == [
-        d.name for d in create_tool_registry(discover_entry_points=False).model_definitions()
+        d.name for d in create_public_tool_registry(discover_entry_points=False).model_definitions()
     ]
     assert "solve_current_problem" not in result.tool_names
     assert "search_locations" not in result.tool_names

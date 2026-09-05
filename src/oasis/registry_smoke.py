@@ -8,13 +8,15 @@ import json
 from pathlib import Path
 
 from oasis.mock_experiments import DATASET_FILES, _validated_config, build_parser, run_experiment
-from oasis.tools import create_tool_registry
+from oasis.tools import create_public_tool_registry
 
 
 async def check(output: Path, data_root: Path, osrm_cache: Path, rows: int) -> None:
     expected_tools = {
         definition.name
-        for definition in create_tool_registry(discover_entry_points=False).model_definitions()
+        for definition in create_public_tool_registry(
+            discover_entry_points=False
+        ).model_definitions()
     }
     for dataset in DATASET_FILES:
         parser = build_parser()

@@ -17,9 +17,9 @@ from oasis.providers.cache import MemorySnapshotCache
 from oasis.providers.mock_dataset import DatasetEvidenceProvider
 from oasis.registry_experiments import RegistrySmokeBackend
 from oasis.schemas import ToolEvent, ToolEventKind
-from oasis.tools import ToolRegistry, create_tool_registry
-from oasis.tools.decision import ImproveTool
+from oasis.tools import ToolRegistry, create_public_tool_registry
 from oasis.tools.decision.common import read_plan
+from oasis.tools.public import CompactImproveTool
 
 
 class RecordingBackend(FakeModelBackend):
@@ -48,11 +48,18 @@ async def test_message_only_ask_answers_without_any_problem(tmp_path: Path) -> N
         assert result["incumbent_timeline"] == []
         assert result["consumed_budget"]["tool_calls"] == 0
         assert len(backend.requests[0].messages) == 2
+        assert {tool["name"] for tool in (await client.get("/api/v1/tools")).json()["tools"]} == {
+            spec.name for spec in create_public_tool_registry(discover_entry_points=False).list()
+        }
         assert backend.requests[0].messages[0].content == AGENT_SYSTEM_PROMPT
         assert backend.requests[0].messages[1].content == "Hello"
-        assert {"compile_problem", "improve", "inspect_artifact", "calculator"} <= {
-            tool.name for tool in backend.requests[0].tools
-        }
+        assert {
+            "compile_max_coverage",
+            "compile_tsp",
+            "improve",
+            "inspect_artifact",
+            "calculator",
+        } <= {tool.name for tool in backend.requests[0].tools}
         replay = await client.get(f"/api/v1/runs/{result['run_id']}")
         assert replay.json()["result"]["answer"] == result["answer"]
 
@@ -117,8 +124,8 @@ async def test_message_to_evidence_compilation_and_improvement(tmp_path: Path) -
         assert transcript[1]["content"] == case.prompt
         calls = [c for m in transcript for c in m.get("tool_calls", [])]
         assert calls[0]["name"] == "resolve_locations"
-        compilation = next(c for c in calls if c["name"] == "compile_problem")
-        assert compilation["arguments"]["type_id"] == "max_weighted_coverage"
+        compilation = next(c for c in calls if c["name"] == "compile_max_coverage")
+        assert compilation["arguments"]["site_limit"] == case.centers_to_place
         assert any(c["name"] == "improve" for c in calls)
         events = app.state.run_store.read_events(result["run_id"])
         first_plan = next(e for e in events if e.kind == "incumbent_committed")
@@ -164,13 +171,13 @@ async def test_tool_limit_returns_the_agent_compiled_plan(tmp_path: Path) -> Non
         assert any(place.name in result["answer"] for place in case.locations)
 
 
-class WaitingImproveTool(ImproveTool):
+class WaitingImproveTool(CompactImproveTool):
     def __init__(self):
         super().__init__()
         self.started = asyncio.Event()
 
     async def stream(self, arguments, context):
-        _, plan = read_plan(context, arguments["starting_plan_artifact_id"])
+        _, plan = read_plan(context, arguments["resume_from"])
         yield ToolEvent(sequence=0, kind=ToolEventKind.CANDIDATE, candidate=plan)
         self.started.set()
         await asyncio.Event().wait()
@@ -181,7 +188,7 @@ async def test_cancel_streaming_tool_preserves_checked_plan_and_map(tmp_path: Pa
     case = load_dataset(DatasetKind.MAX_COVERAGE, Path("data/max_coverage.json"))[0]
     provider = DatasetEvidenceProvider(case.locations, case.region)
     waiting = WaitingImproveTool()
-    base = create_tool_registry(discover_entry_points=False)
+    base = create_public_tool_registry(discover_entry_points=False)
     registry = ToolRegistry(
         [waiting if s.name == "improve" else base.get(s.name) for s in base.list()]
     )
@@ -297,12 +304,15 @@ async def test_model_can_revise_formulation_without_comparing_unrelated_objectiv
     class RevisingBackend(RegistrySmokeBackend):
         def _next_response(self, request):
             compiled = [
-                c for m in request.messages for c in m.tool_calls if c.name == "compile_problem"
+                c
+                for m in request.messages
+                for c in m.tool_calls
+                if c.name == "compile_max_coverage"
             ]
             if len(compiled) == 1:
                 arguments = dict(compiled[0].arguments)
-                arguments["policy"] = {"site_limit": 1}
-                return ToolCall(id="revised", name="compile_problem", arguments=arguments)
+                arguments["site_limit"] = 1
+                return ToolCall(id="revised", name="compile_max_coverage", arguments=arguments)
             if len(compiled) == 2:
                 return "I have revised the plan to use one site."
             return super()._next_response(request)

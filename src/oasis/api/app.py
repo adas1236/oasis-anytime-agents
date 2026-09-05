@@ -52,7 +52,7 @@ from oasis.problems import ProblemRegistry, create_builtin_problem_registry
 from oasis.providers.service import ServiceProviders
 from oasis.runtimes import ComputeInventory
 from oasis.schemas import ArtifactKind, ArtifactRef, PrivacyClassification
-from oasis.tools import ToolRegistry, create_tool_registry
+from oasis.tools import ToolRegistry, create_public_tool_registry
 
 _ARTIFACT_KINDS = frozenset(
     {
@@ -178,7 +178,7 @@ def create_app(
     resolved = settings or OasisSettings()
     artifacts = artifact_store or LocalArtifactStore(resolved.artifact_root)
     runs = run_store or LocalRunStore(resolved.run_root)
-    tools = tool_registry or create_tool_registry(discover_entry_points=False)
+    tools = tool_registry or create_public_tool_registry(discover_entry_points=False)
     problems = problem_registry or create_builtin_problem_registry()
     models = ModelService(resolved, backend=backend, compute_inventory=compute_inventory)
     service_providers = ServiceProviders(resolved) if providers is None else None
@@ -188,7 +188,7 @@ def create_app(
         model_service=models,
         max_concurrent_runs=resolved.api_max_concurrent_runs,
         cancel_wait_seconds=resolved.api_cancel_wait_seconds,
-        tool_registry=tools,
+        tool_registry=tool_registry,
         problem_registry=problems,
         providers=service_providers.providers if service_providers else providers,
         resources=(

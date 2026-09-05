@@ -64,6 +64,7 @@ from oasis.tools import (
     CancellationToken,
     ToolContext,
     ToolRegistry,
+    create_public_tool_registry,
     create_tool_registry,
     invoke_tool,
 )
@@ -146,6 +147,9 @@ class RunManager:
         self.run_store = run_store
         self.model_service = model_service
         self.tool_registry = tool_registry or create_tool_registry(discover_entry_points=False)
+        self.agent_tool_registry = tool_registry or create_public_tool_registry(
+            discover_entry_points=False
+        )
         self.problem_registry = problem_registry or create_builtin_problem_registry()
         self.controller_policy = controller_policy or ControllerPolicy()
         self.providers = dict(providers or {})
@@ -182,7 +186,9 @@ class RunManager:
             )
         for name in request.allowed_tools or ():
             try:
-                self.tool_registry.get(name)
+                (
+                    self.agent_tool_registry if request.message is not None else self.tool_registry
+                ).get(name)
             except ToolRegistryError as error:
                 raise RunManagerError(422, "unknown_tool", str(error)) from error
         run_id = request.run_id or self._new_run_id()
@@ -223,7 +229,7 @@ class RunManager:
                 active.phase = ManagedRunPhase.RUNNING
                 agent = MessageAgent(
                     backend=backend,
-                    tools=self.tool_registry,
+                    tools=self.agent_tool_registry,
                     problems=self.problem_registry,
                     artifacts=self.artifact_store,
                     runs=self.run_store,
@@ -529,7 +535,12 @@ class RunManager:
             ).hardware_validation.value,
             model_profile=(active.backend or self.model_service.backend).profile.name,
             model_id=(active.backend or self.model_service.backend).profile.model_id,
-            tool_versions={spec.name: spec.version for spec in self.tool_registry.list()},
+            tool_versions={
+                spec.name: spec.version
+                for spec in (
+                    self.agent_tool_registry if active.request.message else self.tool_registry
+                ).list()
+            },
             seed=active.request.seed,
             event_count=journal.count,
         )

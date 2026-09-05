@@ -580,15 +580,17 @@ def test_evaluation_worker_runs_subprocess_and_reports_durable_summary(
     assert status["evaluation_summary"]["completed_cells"] == 1
     assert status["evaluation_summary"]["errors"] == 0
     record = json.loads((local_dir / "results.jsonl").read_text().splitlines()[0])
-    from oasis.tools import create_tool_registry
+    from oasis.tools import create_public_tool_registry
 
     expected_tools = [
         definition.name
-        for definition in create_tool_registry(discover_entry_points=False).model_definitions()
+        for definition in create_public_tool_registry(
+            discover_entry_points=False
+        ).model_definitions()
     ]
-    assert record["evaluation_protocol"] == "live_registry_v1"
+    assert record["evaluation_protocol"] == "live_registry_v2"
     assert record["tool_names"] == expected_tools
-    assert len(expected_tools) == 21
+    assert len(expected_tools) == 22
     assert "solve_current_problem" not in record["tool_names"]
     assert record["agent_plan_found"]
     events = capsys.readouterr().out

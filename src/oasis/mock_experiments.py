@@ -1393,7 +1393,7 @@ def _budget_grid(config: ExperimentConfig) -> tuple[BudgetPoint, ...]:
 
 def _config_payload(config: ExperimentConfig) -> dict[str, Any]:
     return {
-        "evaluation_protocol": "live_registry_v1"
+        "evaluation_protocol": "live_registry_v2"
         if config.tool_mode == "registry"
         else "legacy_mock_v1",
         "tool_mode": config.tool_mode,
@@ -1732,7 +1732,7 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     "usage_complete": run.usage_complete,
                 }
                 result = {
-                    "evaluation_protocol": "live_registry_v1"
+                    "evaluation_protocol": "live_registry_v2"
                     if config.tool_mode == "registry"
                     else "legacy_mock_v1",
                     "tool_names": run.tool_names,

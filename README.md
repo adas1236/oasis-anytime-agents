@@ -208,22 +208,65 @@ and torchrun implementation.
 ## Mock dataset experiments
 
 The three JSON files in `data/` can be exercised through one runner. By default, `--tool-mode
-registry` exposes the same 21 tools and argument schemas as the application registry. Only the
-I/O providers are replaced with dataset-backed location/catalog sources and frozen OSRM matrices.
+registry` exposes the same 22 compact tools and argument schemas as the message-first application
+agent (`create_public_tool_registry`). Only the I/O providers are replaced with dataset-backed
+location/catalog sources and frozen OSRM matrices.
 This retains the evaluator's model loop and budget accounting; it is not a replay of the
 application controller's entire orchestration policy.
 The model receives a common system prompt, the record's natural-language prompt, tool definitions,
 and tool results. It must infer the problem family, resolve plaintext names, choose candidates,
-construct evidence, and supply solver parameters itself. Neither `case.locations`, the answer,
+construct evidence, and select objectives/constraints itself. Neither `case.locations`, the answer,
 the cheap fallback, nor hidden case parameters are injected into its context.
 
 Two general-purpose tools also join the live registry: `materialize_locations` turns explicitly
 selected geocoder candidate IDs into point artifacts, and `inspect_artifact` pages tool-produced
 evidence/plans. The former never selects missing or ambiguous names for the model. Coverage uses
-the explicit spherical `haversine` travel strategy to match the toy labels; road tours use
-`routed_provider` and directed OSRM distance weights. Angles are degrees, prompt distances are
-kilometers, and the OSRM tool contract labels its matrix in meters. There are no frozen road
+the spherical `metric="haversine"` to match the toy labels; road tours use
+`metric="driving_distance"` and directed OSRM weights. Angles are degrees and public distance
+matrices are kilometers (the wrapper converts the provider's native meters). There are no frozen road
 durations or raw OSM graphs: requests requiring those data fail rather than fabricate weights.
+
+### Compact model-facing tools
+
+The common planning path no longer exposes nested policies, scenario dictionaries, or raw search
+state. These are general tools over explicitly selected artifacts, not case-specific solvers:
+
+| Tool | Inputs |
+| --- | --- |
+| `build_demand` | `artifact_id`, `need_field`, optional `location_id_field="id"` |
+| `build_candidates` | `artifact_id`, optional `candidate_id_field="id"` |
+| `travel_matrix` | `origins_artifact_id`, `metric`, optional `destinations_artifact_id` |
+| `service_matrix` | `access_matrix_artifact_id`, `threshold` in matrix units |
+| `compile_max_coverage` | `demand`, `candidates`, `access_matrix`, `service_matrix`, `site_limit` |
+| `compile_min_facilities` | Same four artifact IDs plus `coverage_target` (fraction, not percent) |
+| `compile_tsp` | `nodes`, `travel_matrix`, `depot` (resolved node ID) |
+| `improve` | `problem_artifact_id`, optional `strategy="auto"`, `max_candidates=1000`, `resume_from` |
+
+`demand` and `candidates` are the **specification IDs** returned by the construction tools.
+The demand specification must have one explicitly selected need field. Minimum-facilities
+compilation assigns unit cost because its objective is facility **count**, not financial cost.
+TSP means one closed tour without time windows or capacity constraints. Its internal distance
+bound is derived from the matrix and cannot exclude any finite simple tour. Travel points use
+an `id` column; omitted destinations means all-pairs. `driving_time` returns seconds and requires
+a provider with duration data. No mock duration data is fabricated.
+
+`improve` auto-selects `add_swap` for facilities and `two_opt` for routes. Pass a returned
+`resume_token_artifact_id` as `resume_from` to continue with the same strategy, or a plan artifact
+ID to refine that plan. Tokens from a different problem or strategy are rejected. Candidate limits
+bound enumerated searches; explicit OR-Tools strategies use the run's remaining wall deadline.
+
+Location resolution and explicit candidate selection are unchanged. General source, inspection,
+normalization, overlay, public-health, mapping, and summary tools remain available. The advanced
+SDK factory `create_tool_registry()` retains `compile_problem`, `scenario_sweep`, grids, complex
+service responses, equity/scenario policies, and constrained routing. These larger schemas are
+not advertised alongside the compact tools. Prepared-problem controller runs still use that
+advanced interface; to opt a message-first service into it, inject an advanced registry and set
+`agent_system_prompt` to instructions for its tools. Compact compilers reject unknown parameters,
+rather than silently ignoring unsupported constraints.
+
+New evaluations are labeled `evaluation_protocol=live_registry_v2`; their configuration fingerprint
+prevents resuming v1 outputs. Use a new output/run name and rebuild the image before cloud tests.
+Do not pool v1 and v2 results.
 
 Run the offline acceptance check first. It exercises three seed-42 rows per dataset and fails on
 bad registry wiring. `fake` is a scripted prompt-and-tool-results-only recipe, not a measure of model
@@ -324,7 +367,7 @@ prompt; it does not restore a mid-turn model session. Unique attempt directories
 uploaded traces even if the retry starts on a new Pod.
 
 `--tool-mode legacy` explicitly selects the old `search_locations`/`solve_current_problem` harness
-for reproduction only. Its results must not be pooled with `evaluation_protocol=live_registry_v1`.
+for reproduction only. Its results must not be pooled with `evaluation_protocol=live_registry_v2`.
 Fingerprints reject resuming checkpoints from a different tool mode.
 
 ## Deterministic fake chat
@@ -824,7 +867,7 @@ optional baseline `Plan`, or `compile_problem` with the stable tool's structured
 arguments. Structured compilation requires and consumes one declared tool call, and its time is
 included in the request wall deadline. These prepared `source` forms lock an immutable problem
 before controller search. A request must supply exactly one of `message` or `source`. Message
-runs use the full available tool registry; prepared runs retain the legacy `improve` default.
+runs use the compact public tool registry; prepared runs retain the advanced `improve` interface.
 
 The Phase 11 wire revision also accepts `source.kind: "example"` using an ID advertised by
 `GET /api/v1/problems`. Example evidence is frozen, synthetic, and CC0; preparation is performed
@@ -937,14 +980,16 @@ discovery.
 ```bash
 uv run oasis tools list
 uv run oasis tools describe calculator
+uv run oasis tools --advanced describe compile_problem
 uv run oasis tools smoke calculator
 uv run oasis tools smoke calculator \
   --input '{"operation":"multiply","operands":[6,7]}'
 ```
 
 `list`, `describe`, and `smoke` validate built-ins and installed `oasis.tools` entry points before
-use. Add `--no-plugins` immediately after `tools` to inspect built-ins alone. Smoke tests use the
-tool's declared sample input and an absolute deadline; an alternate artifact root can be passed
+use. Commands default to the compact public registry; `--advanced` selects the full low-level
+SDK registry. Add `--no-plugins` immediately after `tools` to inspect built-ins alone. Smoke tests
+use the tool's declared sample input and an absolute deadline; an alternate artifact root can be passed
 with `--artifact-root`. Evidence-tool smoke calls require the artifact IDs named by their schemas;
 use `oasis evidence demo` to create a complete compatible set first.
 

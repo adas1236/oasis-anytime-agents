@@ -72,6 +72,15 @@ def test_tools_cli_lists_describes_and_smokes_calculator(tmp_path: Path) -> None
     )
 
     assert "calculator\t1.0.0" in listed.stdout
+    assert "compile_max_coverage\t2.0.0" in listed.stdout
+    assert "compile_problem\t" not in listed.stdout
+    advanced = subprocess.run(
+        [*base, "--advanced", "describe", "compile_problem"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert len(json.loads(advanced.stdout)["input_schema"]["properties"]) == 22
     assert '"name": "calculator"' in described.stdout
     assert '"status": "complete"' in smoked.stdout
     assert '"value": 5.0' in smoked.stdout

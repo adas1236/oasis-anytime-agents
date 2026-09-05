@@ -45,7 +45,13 @@ from oasis.runtimes import (
     safe_cpu_inventory,
 )
 from oasis.schemas import ToolResult, ToolResultStatus
-from oasis.tools import CancellationToken, ToolContext, create_tool_registry, invoke_tool
+from oasis.tools import (
+    CancellationToken,
+    ToolContext,
+    create_public_tool_registry,
+    create_tool_registry,
+    invoke_tool,
+)
 from oasis.tools.providers import (
     PLACE_PROVIDER,
     ROUTING_PROVIDER,
@@ -93,6 +99,9 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     tools = subparsers.add_parser("tools", help="list, inspect, or smoke-test registry tools")
+    tools.add_argument(
+        "--advanced", action="store_true", help="inspect the full low-level SDK tools"
+    )
     tools.add_argument(
         "--no-plugins", action="store_true", help="do not discover third-party oasis.tools entries"
     )
@@ -415,7 +424,8 @@ async def _chat(args: argparse.Namespace) -> int:
 
 
 async def _tools(args: argparse.Namespace) -> int:
-    registry = create_tool_registry(discover_entry_points=not args.no_plugins)
+    factory = create_tool_registry if args.advanced else create_public_tool_registry
+    registry = factory(discover_entry_points=not args.no_plugins)
     if args.tools_command == "list":
         for spec in registry.list():
             capabilities = ",".join(sorted(spec.capability_tags)) or "-"

@@ -492,7 +492,12 @@ class MessageAgent:
             if result is None:
                 raise RuntimeError("tool produced no result")
             problem_id = call.arguments.get("problem_artifact_id")
-            if call.name == "compile_problem" and result.metrics.get("problem_artifact_id"):
+            if call.name in {
+                "compile_problem",
+                "compile_max_coverage",
+                "compile_min_facilities",
+                "compile_tsp",
+            } and result.metrics.get("problem_artifact_id"):
                 problem_id = result.metrics["problem_artifact_id"]
                 if isinstance(problem_id, str):
                     self._problem(problem_id)

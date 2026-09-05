@@ -36,6 +36,7 @@ from oasis.mock_experiments import (
     _incumbent_event,
     _wait_with_limits,
 )
+from oasis.prompts import AGENT_SYSTEM_PROMPT
 from oasis.providers.cache import MemorySnapshotCache
 from oasis.providers.mock_dataset import DatasetEvidenceProvider, DatasetRoutingProvider
 from oasis.schemas import (
@@ -49,42 +50,21 @@ from oasis.schemas import (
 from oasis.tools import (
     CancellationToken,
     ToolContext,
-    create_tool_registry,
+    create_public_tool_registry,
     invoke_tool,
     stream_tool,
 )
 from oasis.tools.registry import ToolRegistryError
 
-PROTOCOL = "live_registry_v1"
+PROTOCOL = "live_registry_v2"
 
 
 def system_prompt() -> str:
     """Common instructions; no per-case structured fields or problem-family hints."""
 
     return (
-        "Solve the user's geospatial planning problem using the available tools. Infer the "
-        "problem type, place names, depot, and constraints from the prompt. Resolve plaintext "
-        "names with resolve_locations or resolve_area, inspect ambiguous candidates, and select "
-        "their provider_ids explicitly with materialize_locations. Coordinates and population "
-        "must come from tool results. Do not invent artifact IDs or locations. "
-        "materialize_locations can copy the population metadata field and, for equal-cost "
-        "facility counting, assign unit_opening_cost=1. The resulting point fields include id "
-        "and name. Use build_demand and build_candidates for facility planning, travel_matrix "
-        "and service_matrix for access, then compile_problem and improve. Distances in the "
-        "user's prompt are kilometers. Geodesic coverage in these mock prompts means haversine "
-        "distance: use travel_matrix strategy=haversine, output_units=kilometers. "
-        "Driving tours use strategy=routed_provider, routing_profile=driving, "
-        "route_annotation=distance, output_units=meters; these are directed OSRM road distances. "
-        "For distance-only TSP the registry policy uses time_units=meters and shift_length as "
-        "a distance cap; use 1e12 when the prompt imposes no cap, one vehicle, "
-        "and require_return=true. "
-        "For minimum facility count use min_cost_target_coverage, equal opening costs, and a "
-        "coverage_target fraction and site_limit equal to the number of candidate sites when "
-        "the prompt imposes no upper limit. For maximum coverage use max_weighted_coverage "
-        "and site_limit. "
-        "Choose improvement strategies and effort; improve returns a resumable best plan and "
-        "streams feasible improvements. Use summarize_plan for verified metrics before answering. "
-        "inspect_artifact reads tool-produced evidence and plans. The dataset source catalog "
+        AGENT_SYSTEM_PROMPT + "\nIn this evaluation, geodesic coverage means haversine distance. "
+        "Driving distances use frozen directed OSRM road matrices. The dataset source catalog "
         'accepts query={"names": ["place name", ...]} and returns GeoJSON snapshot URLs. '
         "Only dataset-backed sources and frozen OSRM distances are available in this evaluation."
     )
@@ -104,7 +84,7 @@ class RegistrySession:
         self.case = case
         self.osrm = osrm
         self.store = LocalArtifactStore(artifact_root)
-        self.registry = create_tool_registry(discover_entry_points=False)
+        self.registry = create_public_tool_registry(discover_entry_points=False)
         evidence = DatasetEvidenceProvider(case.locations, case.region)
         self.providers: dict[str, object] = {
             "place_resolution": evidence,
@@ -263,7 +243,7 @@ class RegistrySession:
             raise RuntimeError("tool completed without a terminal result")
         if result.candidate is not None:
             await self.observe(result.candidate, call.name, run, clock, tolerance)
-        if call.name == "compile_problem" and result.metrics.get("baseline_plan_artifact_id"):
+        if call.name.startswith("compile_") and result.metrics.get("baseline_plan_artifact_id"):
             plan = Plan.model_validate(
                 read_json(self.store, str(result.metrics["baseline_plan_artifact_id"]))
             )
@@ -561,6 +541,11 @@ class RegistrySmokeBackend(FakeModelBackend):
                 return "The constructed problem is infeasible."
         tsp = "shortest possible total tour distance" in prompt
         minimum = "minimum number of centers" in prompt
+        compile_name = (
+            "compile_tsp"
+            if tsp
+            else ("compile_min_facilities" if minimum else "compile_max_coverage")
+        )
         name = "resolve_locations"
         args: dict[str, JsonValue]
         if name not in observations:
@@ -580,28 +565,20 @@ class RegistrySmokeBackend(FakeModelBackend):
                 "provider_ids": [c["provider_id"] for c in resolved["summary"]["candidates"]],
                 "metadata_fields": [] if tsp else ["population"],
             }
-            if minimum:
-                args["unit_opening_cost"] = 1
         else:
             points = observations["materialize_locations"]["metrics"]["artifact_id"]
             if not tsp and "build_demand" not in observations:
-                name, args = "build_demand", {"artifact_id": points, "need_fields": ["population"]}
+                name, args = "build_demand", {"artifact_id": points, "need_field": "population"}
             elif not tsp and "build_candidates" not in observations:
-                name, args = "build_candidates", {"artifact_id": points, "mode": "supplied"}
-                if minimum:
-                    args["opening_cost_field"] = "opening_cost"
+                name, args = "build_candidates", {"artifact_id": points}
             elif "travel_matrix" not in observations:
                 name, args = (
                     "travel_matrix",
                     {
                         "origins_artifact_id": points,
-                        "destinations_artifact_id": points,
-                        "strategy": "routed_provider" if tsp else "haversine",
-                        "output_units": "meters" if tsp else "kilometers",
+                        "metric": "driving_distance" if tsp else "haversine",
                     },
                 )
-                if tsp:
-                    args.update(routing_profile="driving", route_annotation="distance")
             elif not tsp and "service_matrix" not in observations:
                 radius = re.search(r"within (\d+(?:\.\d+)?) km", prompt)
                 assert radius is not None
@@ -611,25 +588,18 @@ class RegistrySmokeBackend(FakeModelBackend):
                         "access_matrix_artifact_id": observations["travel_matrix"]["metrics"][
                             "artifact_id"
                         ],
-                        "strategy": "binary_threshold",
                         "threshold": float(radius[1]),
                     },
                 )
-            elif "compile_problem" not in observations:
-                name = "compile_problem"
+            elif compile_name not in observations:
+                name = compile_name
                 matrix_id = observations["travel_matrix"]["metrics"]["artifact_id"]
                 if tsp:
                     depot = observations["materialize_locations"]["metrics"]["location_ids"][0]
                     args = {
-                        "type_id": "tsp",
-                        "nodes_artifact_id": points,
-                        "node_id_field": "id",
-                        "travel_matrix_artifact_ids": {"roads": matrix_id},
-                        "policy": {
-                            "depot_ids": [depot],
-                            "time_units": "meters",
-                            "shift_length": 1e12,
-                        },
+                        "nodes": points,
+                        "travel_matrix": matrix_id,
+                        "depot": depot,
                     }
                 else:
                     match = (
@@ -638,40 +608,26 @@ class RegistrySmokeBackend(FakeModelBackend):
                         else re.search(r"place (\d+) centers", prompt)
                     )
                     assert match is not None
-                    policy: dict[str, JsonValue] = (
-                        {
-                            "coverage_target": int(match[1]) / 100,
-                            "site_limit": observations["materialize_locations"]["metrics"][
-                                "row_count"
-                            ],
-                        }
-                        if minimum
-                        else {"site_limit": int(match[1])}
-                    )
                     args = {
-                        "type_id": "min_cost_target_coverage"
-                        if minimum
-                        else "max_weighted_coverage",
-                        "demand_spec_artifact_id": observations["build_demand"]["metrics"][
+                        "demand": observations["build_demand"]["metrics"][
                             "demand_spec_artifact_id"
                         ],
-                        "candidate_spec_artifact_id": observations["build_candidates"]["metrics"][
+                        "candidates": observations["build_candidates"]["metrics"][
                             "candidate_spec_artifact_id"
                         ],
-                        "access_matrix_artifact_id": matrix_id,
-                        "service_matrix_artifact_ids": {
-                            "base": observations["service_matrix"]["metrics"]["artifact_id"]
-                        },
-                        "need_field": "population",
-                        "policy": policy,
+                        "access_matrix": matrix_id,
+                        "service_matrix": observations["service_matrix"]["metrics"]["artifact_id"],
                     }
+                    args["coverage_target" if minimum else "site_limit"] = (
+                        int(match[1]) / 100 if minimum else int(match[1])
+                    )
             elif "improve" not in observations:
-                compiled = observations["compile_problem"]["metrics"]
+                compiled = observations[compile_name]["metrics"]
                 name, args = (
                     "improve",
                     {
                         "problem_artifact_id": compiled["problem_artifact_id"],
-                        "starting_plan_artifact_id": compiled["baseline_plan_artifact_id"],
+                        "resume_from": compiled["baseline_plan_artifact_id"],
                         "strategy": "exact_enumeration",
                         "max_candidates": 100_000,
                     },
@@ -680,7 +636,7 @@ class RegistrySmokeBackend(FakeModelBackend):
                 name, args = (
                     "summarize_plan",
                     {
-                        "problem_artifact_id": observations["compile_problem"]["metrics"][
+                        "problem_artifact_id": observations[compile_name]["metrics"][
                             "problem_artifact_id"
                         ],
                         "plan_artifact_id": observations["improve"]["metrics"][

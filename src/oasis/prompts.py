@@ -13,11 +13,17 @@ normalize evidence as appropriate. If essential information is unavailable, expl
 is missing or ask a focused question in your answer.
 
 For facility planning, build demand and candidates, calculate travel and service matrices,
-then compile_problem with the problem type and policy inferred from the user's request.
-For routes, compile nodes and travel matrices with the inferred depot and constraints.
-Compilation returns an initial plan. Choose improve strategies appropriate to the problem,
-inspect results, and improve iteratively while useful. Resume partial searches with their
-returned resume_token_artifact_id. Keep units consistent with the question and tool schemas.
+then use compile_max_coverage for a site limit or compile_min_facilities for a target
+coverage fraction. build_demand selects one need_field from evidence (e.g. population).
+build_candidates uses supplied points. The compilers take the returned specification IDs.
+For an unconstrained closed tour, use compile_tsp with nodes, travel_matrix and a depot id
+chosen from tool results. Do not use these simple compilers for different objectives or
+constraints they cannot represent; explain the limitation instead of silently discarding it.
+travel_matrix takes a metric: haversine, driving_distance, or driving_time. Distances are
+kilometers; driving_time is seconds. service_matrix takes a threshold in the matrix's units.
+Compilation returns an initial plan. improve defaults to an appropriate strategy; inspect
+results and improve iteratively while useful. Pass a returned resume_token_artifact_id as
+resume_from to continue search, or a plan artifact ID to refine it. Do not transcribe state.
 Use summarize_plan for verified metrics and render_map when a map helps answer the question.
 
 You may revise a mistaken formulation by compiling a corrected problem. Compare objective

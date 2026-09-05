@@ -14,7 +14,7 @@ from oasis.schemas.tools import (
     ToolRuntimeEstimate,
     ToolSpec,
 )
-from oasis.tools.builtins import builtin_tools, create_tool_registry
+from oasis.tools.builtins import builtin_tools, create_public_tool_registry, create_tool_registry
 from oasis.tools.execution import invoke_tool, stream_tool
 from oasis.tools.protocols import (
     CancellationToken,
@@ -46,6 +46,7 @@ __all__ = [
     "ToolRuntimeEstimate",
     "ToolSpec",
     "builtin_tools",
+    "create_public_tool_registry",
     "create_tool_registry",
     "invoke_tool",
     "stream_tool",
