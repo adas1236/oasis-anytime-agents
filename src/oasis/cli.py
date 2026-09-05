@@ -198,6 +198,11 @@ def _parser() -> argparse.ArgumentParser:
     ui.add_argument("--serve-ui", dest="serve_ui", action="store_true", default=None)
     ui.add_argument("--no-serve-ui", dest="serve_ui", action="store_false")
     serve.add_argument("--ui-root", type=Path)
+    serve.add_argument(
+        "--share",
+        action="store_true",
+        help="publish a password-protected Gradio share URL, without an account (requires [share])",
+    )
 
     hardware = subparsers.add_parser("hardware", help="inspect safe or explicitly probed hardware")
     hardware_commands = hardware.add_subparsers(dest="hardware_command", required=True)
@@ -514,7 +519,18 @@ def _serve(args: argparse.Namespace) -> int:
             "ui_root": args.ui_root,
         }
     )
+    if args.share:
+        from oasis.api.sharing import serve_shared, validate_share
+
+        validate_share(host=settings.api_host, serve_ui=settings.serve_ui)
     inventory = inspect_cuda_inventory() if args.probe_cuda else None
+    if args.share:
+        serve_shared(
+            create_app(settings, compute_inventory=inventory),
+            host=settings.api_host,
+            port=settings.api_port,
+        )
+        return 0
     uvicorn.run(
         create_app(settings, compute_inventory=inventory),
         host=settings.api_host,

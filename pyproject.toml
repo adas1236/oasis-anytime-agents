@@ -36,6 +36,10 @@ dependencies = [
 oasis = "oasis.cli:main"
 oasis-runpod = "oasis.runpod_experiments:main"
 
+[project.optional-dependencies]
+# The sharing adapter uses Gradio's internal tunnel helper; pin its tested API.
+share = ["gradio==6.13.0"]
+
 [dependency-groups]
 # uv cannot install CPU and CUDA PyTorch wheels in one environment. Keep CPU as
 # the default group so a bare `uv sync` remains the safe, complete V1 setup.
