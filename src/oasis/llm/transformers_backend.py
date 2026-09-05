@@ -248,7 +248,17 @@ class TransformersInferenceRuntime:
                         Path(self._plan.offload_directory).mkdir(parents=True, exist_ok=True)
                         model_kwargs["offload_folder"] = self._plan.offload_directory
                         model_kwargs["offload_state_dict"] = True
-            model = transformers.AutoModelForCausalLM.from_pretrained(
+            # Gemma 4 checkpoints are multimodal conditional-generation models.
+            # Loading them through AutoModelForCausalLM fails before weights are
+            # downloaded because Gemma4Config is not registered for that auto
+            # class. Text-only/custom profiles continue to use the causal-LM
+            # factory.
+            model_factory = (
+                transformers.AutoModelForMultimodalLM
+                if self.profile.family == "gemma4"
+                else transformers.AutoModelForCausalLM
+            )
+            model = model_factory.from_pretrained(
                 self.profile.model_id,
                 **model_kwargs,
             )

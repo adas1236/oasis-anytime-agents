@@ -1035,6 +1035,19 @@ def _gpu_inventory() -> dict[str, Any]:
     }
 
 
+def _read_log_tail(path: Path, *, max_bytes: int = 16_384) -> str:
+    """Return a bounded, UTF-8-safe log tail for remote failure diagnostics."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            return stream.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return f"Could not read {path.name}: {type(exc).__name__}: {exc}"
+
+
 def worker_main() -> int:
     """Run one planned condition inside a Pod and continuously persist artifacts."""
 
@@ -1171,6 +1184,22 @@ def worker_main() -> int:
             "worker_elapsed_seconds": (finished_at - container_started_at).total_seconds(),
             "runner_exit_code": return_code,
         }
+        if return_code != 0:
+            stderr_tail = _read_log_tail(stderr_path)
+            status["runner_stderr_tail"] = stderr_tail
+            print(
+                json.dumps(
+                    {
+                        "event": "oasis_runner_failed",
+                        "plan_id": plan_id,
+                        "job_id": job_id,
+                        "runner_exit_code": return_code,
+                        "stderr_tail": stderr_tail,
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         _write_json(status_path, status)
         try:
             sync.upload()

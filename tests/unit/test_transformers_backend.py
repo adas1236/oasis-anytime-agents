@@ -57,7 +57,7 @@ def test_cpu_loader_uses_gemma_processor_without_probing_cuda(
 
     auto_config = type("AutoConfig", (Factory,), {})
     auto_processor = type("AutoProcessor", (Factory,), {})
-    auto_model = type("AutoModelForCausalLM", (Factory,), {})
+    auto_model = type("AutoModelForMultimodalLM", (Factory,), {})
 
     def unexpected_cuda_probe() -> bool:
         raise AssertionError("CPU policy must not call torch.cuda.is_available")
@@ -68,7 +68,8 @@ def test_cpu_loader_uses_gemma_processor_without_probing_cuda(
             AutoConfig=auto_config,
             AutoProcessor=auto_processor,
             AutoTokenizer=object(),
-            AutoModelForCausalLM=auto_model,
+            AutoModelForMultimodalLM=auto_model,
+            AutoModelForCausalLM=object(),
         ),
     }
     monkeypatch.setattr(
@@ -82,8 +83,8 @@ def test_cpu_loader_uses_gemma_processor_without_probing_cuda(
 
     assert loaded.device is DevicePolicy.CPU
     assert calls["AutoProcessor"][0] == "google/gemma-4-E4B-it"
-    assert calls["AutoModelForCausalLM"][1]["trust_remote_code"] is False
-    assert calls["AutoModelForCausalLM"][1]["dtype"] == "auto"
+    assert calls["AutoModelForMultimodalLM"][1]["trust_remote_code"] is False
+    assert calls["AutoModelForMultimodalLM"][1]["dtype"] == "auto"
     assert calls["device"] == "cpu"
     assert calls["evaluated"] is True
 
