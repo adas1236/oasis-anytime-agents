@@ -51,9 +51,10 @@ class _GemmaThinkingParser:
     _END = "<channel|>"
     _CONTROL_TOKENS = ("<turn|>", "<|turn>", "<bos>", "<eos>")
 
-    def __init__(self) -> None:
+    def __init__(self, *, thought_prefilled: bool = False) -> None:
         self._buffer = ""
-        self._state = "before_thought"
+        self._state = "thought" if thought_prefilled else "before_thought"
+        self._skip_thought_newline = False
 
     @staticmethod
     def _safe_prefix(buffer: str, marker: str) -> tuple[str, str]:
@@ -74,32 +75,35 @@ class _GemmaThinkingParser:
         thought_parts: list[str] = []
 
         while self._buffer:
+            if self._skip_thought_newline:
+                self._buffer = self._buffer.lstrip("\n")
+                if not self._buffer:
+                    break
+                self._skip_thought_newline = False
+            parts = thought_parts if self._state == "thought" else answer_parts
+            markers: tuple[str, ...] = self._CONTROL_TOKENS
             if self._state == "before_thought":
-                start = self._buffer.find(self._START)
-                if start >= 0:
-                    answer_parts.append(self.strip_control_tokens(self._buffer[:start]))
-                    self._buffer = self._buffer[start + len(self._START) :].lstrip("\n")
+                markers += (self._START,)
+            elif self._state == "thought":
+                markers += (self._END,)
+            found = [
+                (offset, marker) for marker in markers if (offset := self._buffer.find(marker)) >= 0
+            ]
+            if found:
+                offset, marker = min(found)
+                parts.append(self._buffer[:offset])
+                self._buffer = self._buffer[offset + len(marker) :]
+                if marker == self._START:
                     self._state = "thought"
-                    continue
-                safe, remainder = self._safe_prefix(self._buffer, self._START)
-                if safe and not any(token.startswith(safe) for token in self._CONTROL_TOKENS):
-                    answer_parts.append(self.strip_control_tokens(safe))
-                self._buffer = remainder
-                break
-
-            if self._state == "thought":
-                end = self._buffer.find(self._END)
-                if end >= 0:
-                    thought_parts.append(self._buffer[:end])
-                    self._buffer = self._buffer[end + len(self._END) :]
+                    self._skip_thought_newline = True
+                elif marker == self._END:
                     self._state = "answer"
-                    continue
-                safe, self._buffer = self._safe_prefix(self._buffer, self._END)
-                thought_parts.append(safe)
-                break
-
-            answer_parts.append(self.strip_control_tokens(self._buffer))
-            self._buffer = ""
+                continue
+            # Hold partial channel AND control tokens across arbitrary chunk boundaries.
+            safe_length = min(len(self._safe_prefix(self._buffer, m)[0]) for m in markers)
+            parts.append(self._buffer[:safe_length])
+            self._buffer = self._buffer[safe_length:]
+            break
 
         return ParsedModelChunk(text="".join(answer_parts), thought="".join(thought_parts))
 
@@ -176,6 +180,7 @@ class _GemmaValueParser:
             self.index += 1
             return result
         while True:
+            self._skip_space()
             key = (
                 self._string()
                 if self.source.startswith(self._STRING, self.index)
@@ -324,24 +329,30 @@ def parse_gemma_tool_calls(text: str, *, model_id: str) -> tuple[str, tuple[Tool
 
 
 class _BufferedAgenticParser:
-    def __init__(self, model_id: str, *, gemma: bool) -> None:
+    def __init__(self, model_id: str, *, gemma: bool, thought_prefilled: bool = False) -> None:
         self._model_id = model_id
         self._gemma = gemma
+        self._thought_parser = (
+            _GemmaThinkingParser(thought_prefilled=thought_prefilled) if gemma else None
+        )
         self._buffer = ""
 
     def feed(self, text: str) -> ParsedModelChunk:
+        if self._thought_parser is not None:
+            parsed = self._thought_parser.feed(text)
+            self._buffer += parsed.text
+            # Account for reasoning even when the following tool call is malformed.
+            return ParsedModelChunk(thought=parsed.thought)
         self._buffer += text
         return ParsedModelChunk()
 
     def finish(self) -> ParsedModelChunk:
         raw = self._buffer
         self._buffer = ""
-        thought_parser = _GemmaThinkingParser() if self._gemma else None
-        if thought_parser is not None:
-            first = thought_parser.feed(raw)
-            last = thought_parser.finish()
-            answer = first.text + last.text
-            thought = first.thought + last.thought
+        if self._thought_parser is not None:
+            last = self._thought_parser.finish()
+            answer = raw + last.text
+            thought = last.thought
             public, calls = parse_gemma_tool_calls(answer, model_id=self._model_id)
         else:
             thought = ""
@@ -394,6 +405,11 @@ def _gemma_message_dicts(messages: Sequence[ChatMessage]) -> list[dict[str, Any]
             continue
         item: dict[str, Any] = {"role": message.role.value, "content": message.content}
         if message.tool_calls:
+            if message.content:
+                # The native template renders content AFTER calls/results on the same
+                # message. Separate the preamble to preserve chronological order.
+                rendered.append({"role": "assistant", "content": message.content})
+                item["content"] = ""
             item["tool_calls"] = [
                 {"function": {"name": call.name, "arguments": call.arguments}}
                 for call in message.tool_calls
@@ -526,8 +542,10 @@ class PlainChatAdapter:
         )
         return _apply_template(processor, rendered, model_id=self._model_id)
 
-    def stream_parser(self, *, thinking_enabled: bool, tools_enabled: bool = False) -> StreamParser:
-        del thinking_enabled
+    def stream_parser(
+        self, *, thinking_enabled: bool, tools_enabled: bool = False, generation_prefix: str = ""
+    ) -> StreamParser:
+        del thinking_enabled, generation_prefix
         return (
             _BufferedAgenticParser(self._model_id, gemma=False)
             if tools_enabled
@@ -578,10 +596,21 @@ class Gemma4ChatAdapter:
             extra=extra,
         )
 
-    def stream_parser(self, *, thinking_enabled: bool, tools_enabled: bool = False) -> StreamParser:
+    def stream_parser(
+        self, *, thinking_enabled: bool, tools_enabled: bool = False, generation_prefix: str = ""
+    ) -> StreamParser:
+        # The native template opens thought itself after tool results. skip_prompt=True
+        # means generation omits that marker; inspect this request's actual prompt tail.
+        thought_prefilled = generation_prefix.rstrip().endswith(_GemmaThinkingParser._START)
         if tools_enabled:
-            return _BufferedAgenticParser(self._model_id, gemma=True)
-        return _GemmaThinkingParser() if thinking_enabled else _PassthroughParser()
+            return _BufferedAgenticParser(
+                self._model_id, gemma=True, thought_prefilled=thought_prefilled
+            )
+        return (
+            _GemmaThinkingParser(thought_prefilled=thought_prefilled)
+            if thinking_enabled or thought_prefilled
+            else _PassthroughParser()
+        )
 
     def preserve_special_tokens(
         self, *, thinking_enabled: bool, tools_enabled: bool = False

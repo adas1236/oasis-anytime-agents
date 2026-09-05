@@ -4,16 +4,18 @@ import json
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from jinja2 import Environment
 
 from oasis.config import DevicePolicy
 from oasis.errors import ToolCallParseError
 from oasis.llm import transformers_backend
-from oasis.llm.schemas import ChatMessage, ModelRequest, ToolDefinition
+from oasis.llm.schemas import ChatMessage, FinishReason, ModelRequest, ToolCall, ToolDefinition
 from oasis.llm.transformers_backend import (
     TransformersInferenceRuntime,
     TransformersModelBackend,
@@ -108,9 +110,15 @@ print(json.dumps({name: name in sys.modules for name in (\"torch\", \"transforme
 
 
 class StubTensor:
-    def __init__(self, length: int) -> None:
+    def __init__(self, length: int, token_ids: list[int] | None = None) -> None:
         self.shape = (1, length)
         self.device: str | None = None
+        self.token_ids = token_ids or [0] * length
+
+    def __getitem__(self, key: tuple[int, slice]) -> list[int]:
+        row, columns = key
+        assert row == 0
+        return self.token_ids[columns]
 
     def to(self, device: str) -> StubTensor:
         self.device = device
@@ -130,6 +138,11 @@ class StubProcessor:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[str]:
         assert not add_special_tokens
         return text.split()
+
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str:
+        assert kwargs["skip_special_tokens"] is False
+        assert kwargs["clean_up_tokenization_spaces"] is False
+        return "".join(chr(i) for i in token_ids)
 
 
 class StubStreamer:
@@ -294,3 +307,174 @@ async def test_malformed_cuda_tool_call_still_records_usage_and_hardware_success
     assert backend.runtime_plan.hardware_validation is HardwareValidationStatus.PASSED
     assert backend.runtime_plan.metrics.request_count == 1
     assert backend.runtime_plan.metrics.generated_tokens == 2
+
+
+class NativeGemmaProcessor(StubProcessor):
+    """Real pinned Jinja template; lightweight character IDs, no model or torch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        path = Path(__file__).parents[1] / "fixtures/gemma4_chat_template.jinja"
+        self.chat_template = path.read_text()
+        self.template = Environment().from_string(self.chat_template)
+        self.prompt = ""
+
+    def apply_chat_template(self, messages: Any, **kwargs: Any) -> dict[str, StubTensor]:
+        self.prompt = self.template.render(messages=messages, bos_token="<bos>", **kwargs)
+        ids = [ord(c) for c in self.prompt]
+        return {"input_ids": StubTensor(len(ids), token_ids=ids)}
+
+
+class ScriptedGemmaModel:
+    def __init__(self, output: str) -> None:
+        self.output = output
+
+    def generate(self, **kwargs: Any) -> StubTensor:
+        streamer: StubStreamer = kwargs["streamer"]
+        for character in self.output:
+            streamer.push(character)
+        streamer.end()
+        return StubTensor(kwargs["input_ids"].shape[-1] + len(self.output))
+
+
+def native_backend(output: str):
+    backend = TransformersModelBackend(device=DevicePolicy.CPU, inventory=cpu_inventory())
+    processor = NativeGemmaProcessor()
+    model = ScriptedGemmaModel(output)
+    backend._components = _LoadedComponents(
+        torch=SimpleNamespace(),
+        transformers=SimpleNamespace(TextIteratorStreamer=StubStreamer, StoppingCriteriaList=list),
+        model=model,
+        processor=processor,
+        device=DevicePolicy.CPU,
+    )
+    return backend, processor, model
+
+
+def calculator_definition() -> ToolDefinition:
+    return ToolDefinition(
+        name="calculator",
+        description="Calculate.",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("call_again", [False, True])
+async def test_native_template_tool_round_trip_and_reasoning_accounting(
+    thinking: bool, call_again: bool
+) -> None:
+    native_call = "<|tool_call>call:calculator{operands:[1,2]}<tool_call|><|tool_response>"
+    opening = "<|channel>thought\nprivate first<channel|>" if thinking else ""
+    backend, processor, model = native_backend(opening + native_call)
+    request = ModelRequest(
+        request_id="native-first",
+        messages=(ChatMessage(role="user", content="add one and two"),),
+        tools=(calculator_definition(),),
+        thinking_enabled=thinking,
+        max_generated_tokens=1024,
+    )
+    first = await backend.generate(request)
+    assert processor.prompt.endswith("<|turn>model\n")
+    assert first.message.content == ""
+    assert first.finish_reason is FinishReason.TOOL_CALL
+    assert first.usage.reasoning_tokens == (2 if thinking else 0)
+
+    followup = request.model_copy(
+        update={
+            "request_id": "native-second",
+            "messages": (
+                *request.messages,
+                first.message,
+                ChatMessage(
+                    role="tool",
+                    name="calculator",
+                    tool_call_id=first.message.tool_calls[0].id,
+                    content='{"value":3}',
+                ),
+            ),
+        }
+    )
+    model.output = ("private continuation<channel|>" if thinking else "") + (
+        native_call if call_again else "The answer is 3.<turn|>"
+    )
+    counted = await backend.count_input_tokens(followup)
+    second = await backend.generate(followup)
+    expected_suffix = "<|channel>thought\n" if thinking else "<tool_response|>"
+    assert processor.prompt.endswith(expected_suffix)
+    assert "private first" not in processor.prompt
+    assert "response:calculator{value:3}" in processor.prompt
+    assert second.message.content == ("" if call_again else "The answer is 3.")
+    assert len(second.message.tool_calls) == int(call_again)
+    assert second.usage.input_tokens == counted
+    assert second.usage.generated_tokens == len(model.output)
+    assert second.usage.reasoning_tokens == (2 if thinking else 0)
+    assert second.finish_reason is (FinishReason.TOOL_CALL if call_again else FinishReason.STOP)
+
+
+def test_native_template_preserves_preamble_and_parallel_tool_result_order() -> None:
+    processor = NativeGemmaProcessor()
+    calls = (
+        ToolCall(id="one", name="calculator", arguments={"operands": [1, 2]}),
+        ToolCall(id="two", name="calculator", arguments={"operands": [4, 5]}),
+    )
+    adapter = transformers_backend.Gemma4ChatAdapter("google/gemma-4-E4B-it")
+    adapter.prepare_inputs(
+        processor,
+        [
+            ChatMessage(role="user", content="Add each pair."),
+            ChatMessage(role="assistant", content="I will calculate both.", tool_calls=calls),
+            ChatMessage(role="tool", name="calculator", tool_call_id="one", content='{"value":3}'),
+            ChatMessage(role="tool", name="calculator", tool_call_id="two", content='{"value":9}'),
+        ],
+        tools=[calculator_definition()],
+        thinking_enabled=True,
+    )
+    prompt = processor.prompt
+    assert prompt.index("I will calculate both.") < prompt.index("<|tool_call>")
+    assert prompt.index("operands:[1,2]") < prompt.index("operands:[4,5]")
+    assert prompt.index("response:calculator{value:3}") < prompt.index(
+        "response:calculator{value:9}"
+    )
+    assert prompt.count("<|turn>model\n") == 1
+    assert prompt.endswith("<tool_response|><|channel>thought\n")
+
+
+@pytest.mark.asyncio
+async def test_malformed_call_retains_reasoning_usage() -> None:
+    output = "<|channel>thought\nprivate work<channel|><|tool_call>call:calculator{"
+    backend, _, _ = native_backend(output)
+    request = ModelRequest(
+        request_id="native-malformed",
+        messages=(ChatMessage(role="user", content="add"),),
+        thinking_enabled=True,
+        tools=(calculator_definition(),),
+        max_generated_tokens=1024,
+    )
+    with pytest.raises(ToolCallParseError) as caught:
+        await backend.generate(request)
+    usage = caught.value.detail.context["token_usage"]
+    assert usage["reasoning_tokens"] == 2
+    assert usage["generated_tokens"] == len(output)
+    assert "private work" not in caught.value.detail.context["output_excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_thought_only_output_limit_preserves_empty_public_turn_and_usage() -> None:
+    output = "<|channel>thought\nstill reasoning"
+    backend, _, _ = native_backend(output)
+    turn = await backend.generate(
+        ModelRequest(
+            request_id="native-thought-limit",
+            messages=(ChatMessage(role="user", content="add"),),
+            thinking_enabled=True,
+            tools=(calculator_definition(),),
+            max_generated_tokens=len(output),
+        )
+    )
+    assert turn.message.content == ""
+    assert turn.message.tool_calls == ()
+    assert turn.finish_reason is FinishReason.LENGTH
+    assert turn.usage.generated_tokens == len(output)
+    assert turn.usage.reasoning_tokens == 2

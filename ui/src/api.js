@@ -40,6 +40,10 @@ async function json(relative, options) {
   return (await apiRequest(relative, options)).json();
 }
 
+export function checkService() {
+  return json("health");
+}
+
 export async function loadServiceCatalogs() {
   const [health, models, runtime, tools, problems] = await Promise.all([
     json("health"),

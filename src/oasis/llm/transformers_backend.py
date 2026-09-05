@@ -410,6 +410,15 @@ class TransformersInferenceRuntime:
                 thinking_enabled=request.thinking_enabled,
             )
         )
+        generation_prefix = ""
+        if self.profile.family == "gemma4" and request.thinking_enabled:
+            tokenizer = getattr(components.processor, "tokenizer", components.processor)
+            # Decode only the CPU prompt tail, not the entire growing conversation.
+            generation_prefix = tokenizer.decode(
+                prepared["input_ids"][0, -32:],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
         inputs = self._move_inputs(prepared, components.device)
         input_tokens = self._input_token_count(inputs)
         preserve_special = self._adapter.preserve_special_tokens(
@@ -428,6 +437,7 @@ class TransformersInferenceRuntime:
         parser: StreamParser = self._adapter.stream_parser(
             thinking_enabled=request.thinking_enabled,
             tools_enabled=bool(request.tools),
+            generation_prefix=generation_prefix,
         )
         thought_text = ""
 

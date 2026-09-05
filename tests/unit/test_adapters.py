@@ -186,6 +186,64 @@ def test_gemma_native_call_parser_rejects_malformed_output() -> None:
         )
 
 
+@pytest.mark.parametrize("tools_enabled", [False, True])
+@pytest.mark.parametrize("prefilled", [False, True])
+def test_gemma_thought_and_control_tokens_at_every_chunk_boundary(
+    tools_enabled: bool, prefilled: bool
+) -> None:
+    adapter = Gemma4ChatAdapter("google/gemma-4-E4B-it")
+    start = "<|channel>thought\n"
+    raw = ("" if prefilled else "<bos>" + start) + "private work<channel|>Answer<turn|><eos>"
+    for split in range(len(raw) + 1):
+        parser = adapter.stream_parser(
+            thinking_enabled=True,
+            tools_enabled=tools_enabled,
+            generation_prefix=start if prefilled else "<|turn>model\n",
+        )
+        parts = [parser.feed(raw[:split]), parser.feed(raw[split:]), parser.finish()]
+        assert "".join(p.text for p in parts) == "Answer", split
+        assert "".join(p.thought for p in parts) == "private work", split
+
+
+def test_prefilled_thought_tool_call_is_separate_from_public_content() -> None:
+    parser = Gemma4ChatAdapter("google/gemma-4-E4B-it").stream_parser(
+        thinking_enabled=True,
+        tools_enabled=True,
+        generation_prefix="<tool_response|><|channel>thought\n",
+    )
+    first = parser.feed(
+        'Use the returned ID.<channel|><|tool_call>call:calculator{operation:<|"|>add<|"|>,'
+        "operands:[1,2]}<tool_call|><|tool_response>"
+    )
+    last = parser.finish()
+    assert first.thought + last.thought == "Use the returned ID."
+    assert first.text + last.text == ""
+    assert len(last.tool_calls) == 1
+    assert last.tool_calls[0].arguments == {"operation": "add", "operands": [1, 2]}
+
+
+def test_tool_call_inside_unfinished_thought_is_not_executed() -> None:
+    parser = Gemma4ChatAdapter("google/gemma-4-E4B-it").stream_parser(
+        thinking_enabled=True, tools_enabled=True, generation_prefix="<|channel>thought\n"
+    )
+    raw = "Maybe use <|tool_call>call:calculator{operands:[1,2]}<tool_call|>"
+    first = parser.feed(raw)
+    last = parser.finish()
+    assert first.thought + last.thought == raw
+    assert first.text + last.text == ""
+    assert first.tool_calls + last.tool_calls == ()
+
+
+def test_gemma_native_parser_accepts_whitespace_before_quoted_dictionary_keys() -> None:
+    public, calls = parse_gemma_tool_calls(
+        '<|tool_call>call:example{values:{<|"|>first key<|"|>:1, \n'
+        '<|"|>second key<|"|>:2}}<tool_call|><|tool_response>',
+        model_id="google/gemma-4-E4B-it",
+    )
+    assert public == ""
+    assert calls[0].arguments == {"values": {"first key": 1, "second key": 2}}
+
+
 def test_generic_fallback_formats_instruction_and_parses_tagged_json() -> None:
     processor = StubProcessor()
     adapter = PlainChatAdapter("organization/chat-model")

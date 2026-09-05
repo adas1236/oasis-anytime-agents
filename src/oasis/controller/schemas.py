@@ -25,6 +25,7 @@ class ControllerState(StrEnum):
 
     RECEIVED = "received"
     GROUNDING = "grounding"
+    REASONING = "reasoning"
     PROBLEM_LOCKED = "problem_locked"
     ADMITTED = "admitted"
     BASELINE_COMMITTED = "baseline_committed"
@@ -52,6 +53,11 @@ class TerminalReason(StrEnum):
     PLATEAU = "plateau"
     MODEL_STOPPED = "model_stopped"
     INTERNAL_FAILURE = "internal_failure"
+    TOOL_CALL_LIMIT = "tool_call_limit"
+    TOOL_ROUND_LIMIT = "tool_round_limit"
+    MODEL_CALL_TIMEOUT = "model_call_timeout"
+    CONTEXT_LIMIT = "context_limit"
+    MODEL_OUTPUT_LIMIT = "model_output_limit"
 
 
 class RunStatus(StrEnum):
@@ -378,7 +384,11 @@ class RunResult(BaseModel):
     terminal_reason: TerminalReason
     final_state: Literal[ControllerState.FINALIZED] = ControllerState.FINALIZED
     budget_tier: BudgetTier
-    problem_artifact_id: str
+    problem_artifact_id: str | None = None
+    answer: str | None = None
+    answer_source: Literal["model", "plan", "status"] | None = None
+    conversation_artifact_id: str | None = None
+    usage_complete: bool = True
     problem_hash: str | None = None
     evidence_hash: str | None = None
     policy_hash: str | None = None

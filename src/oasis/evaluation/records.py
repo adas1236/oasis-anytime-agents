@@ -151,11 +151,12 @@ def _artifact_profile(
     store: ArtifactStore,
 ) -> tuple[int, int, int]:
     pending = {
-        result.problem_artifact_id,
         *(event_id for event in events for event_id in event.artifact_ids),
         *(incumbent.plan_artifact_id for incumbent in result.incumbent_timeline),
         *(incumbent.scorecard_artifact_id for incumbent in result.incumbent_timeline),
     }
+    if result.problem_artifact_id is not None:
+        pending.add(result.problem_artifact_id)
     if result.verified_bound_artifact_id is not None:
         pending.add(result.verified_bound_artifact_id)
     visited: set[str] = set()

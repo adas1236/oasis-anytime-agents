@@ -52,3 +52,15 @@ def test_responsive_styles_cover_narrow_and_wide_layouts() -> None:
     assert "@media (max-width: 720px)" in styles
     assert ":focus-visible" in styles
     assert "prefers-reduced-motion" in styles
+
+
+def test_primary_ui_requires_only_a_message_and_displays_the_answer() -> None:
+    index = (UI_ROOT / "index.html").read_text(encoding="utf-8")
+    app = (UI_ROOT / "src" / "app.js").read_text(encoding="utf-8")
+    assert '<textarea id="message"' in index
+    assert 'id="answer"' in index
+    assert 'id="cancel-run"' in index
+    assert all(name not in index for name in ("problem-example", "model-profile", "total-tokens"))
+    assert "const request = { message };" in app
+    assert "result.answer" in app
+    assert "innerHTML" not in app

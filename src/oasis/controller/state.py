@@ -28,7 +28,7 @@ class InvalidStateTransitionError(RuntimeError):
 LEGAL_TRANSITIONS: dict[ControllerState, frozenset[ControllerState]] = {
     ControllerState.RECEIVED: frozenset({ControllerState.GROUNDING, ControllerState.QUIESCING}),
     ControllerState.GROUNDING: frozenset(
-        {ControllerState.PROBLEM_LOCKED, ControllerState.QUIESCING}
+        {ControllerState.PROBLEM_LOCKED, ControllerState.REASONING, ControllerState.QUIESCING}
     ),
     ControllerState.PROBLEM_LOCKED: frozenset(
         {ControllerState.ADMITTED, ControllerState.QUIESCING}
@@ -40,6 +40,7 @@ LEGAL_TRANSITIONS: dict[ControllerState, frozenset[ControllerState]] = {
         {ControllerState.SEARCHING, ControllerState.QUIESCING}
     ),
     ControllerState.SEARCHING: frozenset({ControllerState.QUIESCING}),
+    ControllerState.REASONING: frozenset({ControllerState.QUIESCING}),
     ControllerState.QUIESCING: frozenset({ControllerState.FINALIZED}),
     ControllerState.FINALIZED: frozenset(),
 }

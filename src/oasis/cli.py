@@ -58,6 +58,8 @@ from oasis.tools.registry import ToolRegistryError
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oasis")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    ask = subparsers.add_parser("ask", help="answer a message using the agent and server defaults")
+    ask.add_argument("message", help="the question or task, in ordinary language")
     chat = subparsers.add_parser("chat", help="stream a raw, multi-turn text chat")
     chat.add_argument("--backend", choices=[kind.value for kind in BackendKind])
     chat.add_argument("--profile", choices=sorted(MODEL_PROFILES))
@@ -777,10 +779,25 @@ async def _live_evidence_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _ask(message: str) -> int:
+    from oasis.api import create_app
+    from oasis.api.schemas import RunCreateRequest
+
+    app = create_app(OasisSettings())
+    async with app.router.lifespan_context(app):
+        manager = app.state.run_manager
+        created = await manager.start(RunCreateRequest(message=message))
+        result = await manager.wait(created.run_id)
+        print(result.answer)
+        return 1 if result.status in {"failed", "rejected"} else 0
+
+
 def _run(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "ask":
+            return asyncio.run(_ask(args.message))
         if args.command == "chat":
             return asyncio.run(_chat(args))
         if args.command == "tools":

@@ -80,8 +80,10 @@ class ChatMessage(BaseModel):
             self.tool_call_id is not None or self.name is not None
         ):
             raise ValueError("tool_call_id and name are only valid on tool messages")
-        if not self.content and not self.tool_calls and self.role is not ChatRole.TOOL:
-            raise ValueError("a non-tool message requires content or a tool call")
+        # An output limit/cancellation can end generation inside private reasoning,
+        # leaving no public assistant text. Preserve its terminal reason and usage.
+        if not self.content and self.role in {ChatRole.SYSTEM, ChatRole.USER}:
+            raise ValueError("a system or user message requires content")
         return self
 
 

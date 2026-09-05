@@ -1,27 +1,23 @@
 # OASIS Anytime GeoAI Agent
 
-OASIS is a budget-aware GeoAI agent for public-health and spatial-equity planning. The Phase 12
-demonstration release provides typed configuration, model-independent streaming chat, Gemma 4
-profiles, immutable content-addressed artifacts, a validated async tool SDK, deterministic and
-live/snapshotted evidence planes, and independently evaluated location-allocation optimization.
-It also provides directed routing for mobile services and immutable demand, travel, and facility
-scenario analysis. A framework-neutral anytime controller now owns immutable problem admission,
-hard wall/token/tool budgets, atomic monotone incumbents, deterministic fallback, cancellation,
-and append-only traces. A versioned asynchronous FastAPI service exposes model, tool, problem,
-runtime, run, artifact, map, and replayable SSE contracts through `/api/v1`. A typed, hardware-
-neutral runtime layer supports safe CPU planning, explicitly probed CUDA, memory-oriented
-Accelerate dispatch across GPUs on one machine, and an authenticated remote model-worker
-protocol. A manifest-driven evaluation harness now generates versioned synthetic instances,
-builds independently scored exact or best-known references, runs paired controller comparisons,
-and reports quality over wall time and model tokens. Gemma 4 uses its native
-tool format; compatible non-Gemma chat models use a conservative tagged-JSON fallback. The fake
-backend and frozen fixtures exercise the complete current workflow without model weights, network
-access, or a GPU. A no-build, accessible web client now launches and follows runs exclusively
-through `/api/v1`, including reconnect, cancellation, live verified maps, equity metrics, and
-runtime resolution. A seven-problem Track B showcase now publishes independently scored absolute
-health/equity metrics, improvement histories, immutable run hashes, resource profiles, and a
-privacy/provenance audit. Real-hardware and real-model evaluation remain opt-in; this workspace
-has also completed the documented RTX 5060 Ti/Gemma 4 E2B compatibility smoke.
+OASIS answers messages using a model and a registry of geospatial planning tools. The user
+supplies a question; the agent interprets it, gathers evidence, compiles an optimization problem
+when needed, and improves its plan through further tool calls. Ordinary questions can receive a
+direct answer. Problem types, solver strategies, budgets, model selection, and provider setup do
+not need to be configured by the user.
+
+The message agent enforces aggregate time, token, and tool-call limits, retains independently
+checked plans as they arrive, and persists its answer, tool conversation, and replayable events.
+It starts without a prepared problem or synthetic fallback answer. Its first model input is the
+message, a shared system prompt, and tool definitions; subsequent turns include the model's own
+actions and tool results. Plan checks validate the agent's formulation, so they do not establish
+that the formulation correctly captures every user constraint.
+
+The repository also retains the prepared-problem `AnytimeController`, synthetic showcase, and
+manifest-based evaluation runner for optimization comparisons. The dataset registry experiments
+use the same tools with mock providers and separate benchmark grading. Those experiments retain
+their existing benchmark fallback; the application message agent does not import benchmark cases,
+labels, case-specific problem types, or that fallback.
 
 ## Setup
 
@@ -49,6 +45,62 @@ git diff --check
 
 The default tests are offline and CPU-only. Tests that require network, model weights, GPU,
 multi-GPU, or long runtimes use explicit pytest markers and opt-in configuration.
+
+## Ask a question
+
+With a model configured on the backend, run:
+
+```bash
+uv run oasis ask "What is the difference between travel distance and straight-line distance?"
+uv run oasis serve --serve-ui
+```
+
+Open `http://127.0.0.1:8000/`, enter a message, and select **Ask OASIS**. The page displays the
+answer, updates when a checked plan is available, and lets you stop an active run. Maps, solution
+quality, and tool activity are available in expandable details. Refreshing reconnects to the run.
+`--backend fake` (or `OASIS_BACKEND=fake`) is available for offline plumbing checks; its default
+behavior is an echo, not a reasoning model.
+
+The simplest HTTP interface waits for an answer:
+
+```bash
+curl -sS http://127.0.0.1:8000/api/v1/ask \
+  -H 'Content-Type: application/json' \
+  --data '{"message":"What is 6 times 7?"}'
+```
+
+Read the response's `answer` field. For progress, cancellation, or longer requests, submit the
+same body to `POST /api/v1/runs`, then inspect the returned run URL or follow its SSE events.
+Both interfaces accept a message without a problem type, artifact reference, or budget.
+A run's `answer_source` distinguishes model prose, a retained plan rendered after interruption,
+and a status message when no answer was established. `problem_artifact_id` is null until the
+agent actually constructs a problem. A request for missing information can be a valid text answer;
+each submission is an independent run, so include the relevant context when submitting a follow-up.
+
+Operators can configure these defaults through the environment:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `OASIS_AGENT_WALL_TIME_MS` | `120000` | Run wall-time budget after model startup |
+| `OASIS_AGENT_TOTAL_TOKENS` | `512000` | Aggregate input plus generated tokens |
+| `OASIS_AGENT_GENERATED_TOKENS` | `32768` | Aggregate generated tokens, capped by total tokens |
+| `OASIS_AGENT_GENERATION_TOKENS` | `2048` | Output cap for one model turn |
+| `OASIS_AGENT_TOOL_CALLS` | `64` | Total tool calls |
+| `OASIS_AGENT_TOOL_ROUNDS` | `20` | Model/tool cycles |
+| `OASIS_AGENT_MODEL_TIMEOUT_SECONDS` | `60` | Timeout for one model operation |
+| `OASIS_AGENT_SYSTEM_PROMPT` | Shared OASIS prompt | Optional backend instruction override |
+| `OASIS_PLACE_ENDPOINT` | Public Nominatim | Place resolution service |
+| `OASIS_ROUTING_ENDPOINT` | Public OSRM | Road routing service |
+| `OASIS_CATALOG_ENDPOINT` | Unset | Optional STAC catalog; enables `search_sources` |
+
+Existing model/runtime and provider HTTP settings still apply. Provider clients are lazy, and
+`create_app(..., providers=..., resources=...)` supports private or offline adapters without
+changing the agent loop. Only tools whose declared provider/resource prerequisites are available
+are exposed. The host enforces budgets without injecting case metadata or budget messages into
+the model conversation. Tools run under deadlines with in-process cancellation; these are not
+OS-level hard time limits. On interruption, validated plans are retained, and no extra model
+turn is required to return the result. Prose answers are model-generated and are not independently
+verified in the way structured plans are.
 
 ## Track B demonstration release
 
@@ -737,15 +789,17 @@ The stable `/api/v1` surface is:
 | `GET` | `/tools` | Typed tool catalog |
 | `GET` | `/problems` | Problem-plugin catalog |
 | `POST` | `/chat` | Bounded raw chat through the service-owned backend |
-| `POST` | `/runs` | Immediately accept a capacity-available asynchronous run |
+| `POST` | `/ask` | Answer a message using server defaults; waits for the result |
+| `POST` | `/runs` | Start an asynchronous message run, or an explicit prepared-problem run |
 | `GET` | `/runs/{run_id}` | Inspect current state or the persisted final result |
 | `GET` | `/runs/{run_id}/events` | Replay and follow ordered Server-Sent Events |
 | `POST` | `/runs/{run_id}/cancel` | Idempotently cancel and return the retained result |
 | `GET` | `/artifacts/{artifact_id}` | Retrieve an allowlisted public artifact |
 | `GET` | `/runs/{run_id}/map` | Render/retrieve a validated location-plan map |
 
-Create a run by referring to problem and optional baseline artifacts already in the configured
-artifact store:
+The primary run request is `{"message":"Your question or task"}`. The prepared-problem API
+remains available for advanced callers and controller benchmarks. For that mode, refer to
+problem and optional baseline artifacts already in the configured artifact store:
 
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/runs \
@@ -768,8 +822,9 @@ curl -sS http://127.0.0.1:8000/api/v1/runs \
 `source.kind` may instead be `inline` with a complete compiled location/routing problem and an
 optional baseline `Plan`, or `compile_problem` with the stable tool's structured evidence/policy
 arguments. Structured compilation requires and consumes one declared tool call, and its time is
-included in the request wall deadline. All accepted forms lock an immutable problem before
-controller search.
+included in the request wall deadline. These prepared `source` forms lock an immutable problem
+before controller search. A request must supply exactly one of `message` or `source`. Message
+runs use the full available tool registry; prepared runs retain the legacy `improve` default.
 
 The Phase 11 wire revision also accepts `source.kind: "example"` using an ID advertised by
 `GET /api/v1/problems`. Example evidence is frozen, synthetic, and CC0; preparation is performed
@@ -817,27 +872,17 @@ client is isolated in `ui/src/api.js`; form, chart, state, and map code do not c
 URLs. Replacing the entire directory therefore requires no Python changes while `/api/v1` remains
 compatible, and the backend and evaluator continue to work headlessly.
 
-The form loads model profiles, launchable public-health examples, tools, problem plugins, and
-runtime choices from the service. It exposes Gemma 4 profile and explicit Hugging Face ID
-selection, wall/model-token/generated-token/tool-call budgets, server-advertised equity templates
-and group floors, and advanced device/engine/dtype/quantization settings. The default advanced
-choice preserves the server's deployment policy. Reasoning mode carries a visible warning because
-reasoning tokens consume budget; private thought content is never shown.
+The form accepts a message and uses server defaults. It does not require a problem category,
+equity template, model, or budget. The answer is displayed as text; tool activity, optional maps,
+and solution quality are available in expandable details. SSE reconnect uses `Last-Event-ID`,
+and browser storage retains the active run across refreshes. Stop requests preserve any checked
+plan already found. Model loading and the initial tool workflow may take time before an answer
+or plan is available.
 
-During a run, the client keeps the last independently verified scorecard and map visible while new
-work continues. It shows raw, group, and scenario metrics, baseline-relative comparator gain,
-remaining budget, an incumbent quality curve, ordered action/tool events, requested versus
-resolved runtime, sanitized hardware, evidence age, warnings, and termination status. SSE is read
-through a reconnecting fetch stream so the client can send `Last-Event-ID`; compact UI state is
-also kept in browser local storage, allowing a refresh or disconnect without discarding the
-displayed incumbent. Cancellation retains that incumbent.
-
-For a manual smoke check, launch each advertised example, confirm that a baseline map and metric
-appear before completion, refresh during a run to exercise replay, cancel an active run, and check
-failure/completed messages. Repeat once below 720 CSS pixels and once at a wide desktop viewport;
-all controls and trace entries remain keyboard reachable, with shape and text reinforcing color.
-The default test suite verifies static/API contract alignment and does not require a browser,
-network, model weights, or Node.
+For a manual smoke check, submit a plain question, then a planning question using configured
+providers. Confirm that an answer appears, refresh during a run, and stop an active run. Repeat
+below 720 CSS pixels and at a desktop viewport. The offline tests cover message-only requests,
+real tool execution with fixture providers, answer persistence, limits, cancellation, and replay.
 
 ## Reproducible evaluation
 
@@ -938,6 +983,8 @@ The normal onboarding path is deliberately five steps:
 | `compile_problem` | 1.1.0 | Compile immutable location or route evidence/policy and seed a feasible baseline | Local artifacts |
 | `derive_health_measure` | 1.0.0 | Compute counts, rates, and direct age-standardized rates | Local artifacts |
 | `improve` | 1.1.0 | Run a resumable location/routing strategy and stream verified improvements | Local artifacts |
+| `inspect_artifact` | 1.0.0 | Page JSON, table/vector attributes, and matrix rows | None |
+| `materialize_locations` | 1.0.0 | Turn explicitly selected geocoder candidates into point evidence | Local artifacts |
 | `isochrones` | 1.0.0 | Compute graph reachable-node sets at explicit cutoffs | Local artifacts |
 | `normalize_artifact` | 1.0.0 | Normalize CRS, geometry, IDs, clipping, and units | Local artifacts |
 | `overlay_reduce` | 1.0.0 | Join, reduce, find nearest features, and sample rasters | Local artifacts |

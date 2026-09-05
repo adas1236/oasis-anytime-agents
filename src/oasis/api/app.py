@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -26,6 +26,7 @@ from oasis.api.schemas import (
     ChatRequest,
     ChatResponse,
     HealthResponse,
+    MessageRequest,
     ModelCatalogEntry,
     ModelCatalogResponse,
     ProblemCatalogEntry,
@@ -44,10 +45,11 @@ from oasis.artifacts import (
     LocalArtifactStore,
 )
 from oasis.config import OasisSettings
-from oasis.controller import LocalRunStore, RunStore, RunStoreError
+from oasis.controller import LocalRunStore, RunResult, RunStore, RunStoreError
 from oasis.errors import ModelBackendError
 from oasis.llm import DEFAULT_PROFILE_NAME, MODEL_PROFILES, ModelBackend
 from oasis.problems import ProblemRegistry, create_builtin_problem_registry
+from oasis.providers.service import ServiceProviders
 from oasis.runtimes import ComputeInventory
 from oasis.schemas import ArtifactKind, ArtifactRef, PrivacyClassification
 from oasis.tools import ToolRegistry, create_tool_registry
@@ -168,6 +170,8 @@ def create_app(
     tool_registry: ToolRegistry | None = None,
     problem_registry: ProblemRegistry | None = None,
     compute_inventory: ComputeInventory | None = None,
+    providers: Mapping[str, object] | None = None,
+    resources: Mapping[str, object] | None = None,
 ) -> FastAPI:
     """Build a side-effect-bounded service with injectable stores and fake backends."""
 
@@ -177,6 +181,7 @@ def create_app(
     tools = tool_registry or create_tool_registry(discover_entry_points=False)
     problems = problem_registry or create_builtin_problem_registry()
     models = ModelService(resolved, backend=backend, compute_inventory=compute_inventory)
+    service_providers = ServiceProviders(resolved) if providers is None else None
     manager = RunManager(
         artifact_store=artifacts,
         run_store=runs,
@@ -185,6 +190,14 @@ def create_app(
         cancel_wait_seconds=resolved.api_cancel_wait_seconds,
         tool_registry=tools,
         problem_registry=problems,
+        providers=service_providers.providers if service_providers else providers,
+        resources=(
+            resources
+            if resources is not None
+            else service_providers.resources
+            if service_providers
+            else {}
+        ),
     )
 
     @asynccontextmanager
@@ -194,6 +207,8 @@ def create_app(
         finally:
             await manager.close()
             await models.close()
+            if service_providers is not None:
+                await service_providers.close()
 
     app = FastAPI(
         title="OASIS Anytime GeoAI API",
@@ -308,6 +323,12 @@ def create_app(
     @app.post("/api/v1/runs", status_code=202, response_model=RunCreatedResponse)
     async def create_run(request: RunCreateRequest) -> RunCreatedResponse:
         return await manager.start(request)
+
+    @app.post("/api/v1/ask", response_model=RunResult)
+    async def ask(request: MessageRequest) -> RunResult:
+        """Submit only a message and wait for an answer using server defaults."""
+        created = await manager.start(RunCreateRequest(message=request.message))
+        return await manager.wait(created.run_id)
 
     @app.get("/api/v1/runs/{run_id}", response_model=RunInspectionResponse)
     async def inspect_run(run_id: str) -> RunInspectionResponse:

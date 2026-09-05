@@ -10,6 +10,23 @@ import pytest
 from oasis.config import OasisSettings, RuntimeEngine
 
 
+def test_ask_cli_needs_only_a_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OASIS_BACKEND", "fake")
+    monkeypatch.setenv("OASIS_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OASIS_RUN_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("OASIS_PROVIDER_CACHE_ROOT", str(tmp_path / "cache"))
+    completed = subprocess.run(
+        [sys.executable, "-m", "oasis.cli", "ask", "Hello"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == "[fake] Hello"
+    result = json.loads(next((tmp_path / "runs").glob("*/result.json")).read_text())
+    assert result["answer"] == "[fake] Hello"
+    assert result["problem_artifact_id"] is None
+
+
 def test_fake_cli_completes_multi_turn_exchange() -> None:
     completed = subprocess.run(
         [

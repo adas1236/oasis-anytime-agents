@@ -44,6 +44,7 @@ body {
 
 button,
 input,
+textarea,
 select {
   font: inherit;
 }
@@ -56,6 +57,7 @@ input[type="checkbox"] {
 
 button:focus-visible,
 input:focus-visible,
+textarea:focus-visible,
 select:focus-visible,
 summary:focus-visible,
 a:focus-visible {
@@ -236,6 +238,7 @@ label span {
 
 input[type="text"],
 input[type="number"],
+textarea,
 select {
   width: 100%;
   min-height: 2.75rem;
@@ -244,6 +247,25 @@ select {
   background: white;
   border: 1px solid #aeb8af;
   border-radius: 9px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 12rem;
+  line-height: 1.6;
+}
+
+.answer {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+  margin-bottom: var(--space-4);
+}
+
+details > summary {
+  cursor: pointer;
+  margin-bottom: var(--space-3);
+  font-weight: 700;
 }
 
 input:hover,

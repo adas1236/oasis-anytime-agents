@@ -36,7 +36,7 @@ class ConversationAdapter(Protocol):
     ) -> Mapping[str, Any]: ...
 
     def stream_parser(
-        self, *, thinking_enabled: bool, tools_enabled: bool = False
+        self, *, thinking_enabled: bool, tools_enabled: bool = False, generation_prefix: str = ""
     ) -> StreamParser: ...
 
     def preserve_special_tokens(

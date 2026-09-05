@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
 
 from oasis.config import DevicePolicy, RuntimeConfig, RuntimeEngine
 from oasis.controller import BudgetSpec, BudgetTier, ControllerState, RunResult
@@ -13,7 +13,7 @@ from oasis.llm import ChatMessage, FinishReason, ModelCapabilities, TokenUsage, 
 from oasis.problems import LocationAllocationProblem, RouteServiceProblem
 from oasis.schemas import Plan, ToolSpec
 
-API_SCHEMA_VERSION = "1.1.0"
+API_SCHEMA_VERSION = "1.2.0"
 
 
 class HealthResponse(BaseModel):
@@ -259,22 +259,49 @@ RunSource = Annotated[
 
 
 class RunCreateRequest(BaseModel):
-    """Versioned request for one immutable, capacity-admitted controller run."""
+    """Start from a message, or explicitly use the legacy prepared-problem interface."""
 
     model_config = ConfigDict(frozen=True)
 
     run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-    source: RunSource
-    budget: BudgetSpec
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = None
+    source: RunSource | None = None
+    budget: BudgetSpec = Field(
+        default_factory=lambda: BudgetSpec(
+            wall_time_ms=120_000,
+            max_total_model_tokens=512_000,
+            max_generated_tokens=32_768,
+            max_tool_calls=64,
+        )
+    )
     seed: int = 0
     enable_model: bool = True
     enable_deterministic_fallback: bool = True
-    allowed_tools: tuple[str, ...] = Field(default=("improve",), max_length=16)
+    allowed_tools: tuple[str, ...] | None = None
     thinking_enabled: bool = False
     requested_tier: BudgetTier | None = None
     model_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
     model_id: str | None = Field(default=None, min_length=1, max_length=512)
     runtime_policy: RuntimeConfig | None = None
+
+    @model_validator(mode="after")
+    def one_input(self) -> Self:
+        if (self.message is None) == (self.source is None):
+            raise ValueError("supply exactly one of message or source")
+        if self.allowed_tools is not None and len(set(self.allowed_tools)) != len(
+            self.allowed_tools
+        ):
+            raise ValueError("allowed tool names must be unique")
+        if self.message is not None and not self.enable_model:
+            raise ValueError("message runs require the model")
+        return self
+
+
+class MessageRequest(BaseModel):
+    """The public message-to-answer interface; configuration belongs to the server."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class RunLinks(BaseModel):

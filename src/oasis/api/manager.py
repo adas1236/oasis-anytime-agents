@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from oasis.agent import MessageAgent
 from oasis.api.examples import prepare_example
 from oasis.api.lifecycle import ModelService
 from oasis.api.schemas import (
@@ -26,6 +27,7 @@ from oasis.artifacts import ArtifactNotFoundError, ArtifactProvenance, ArtifactS
 from oasis.controller import (
     AnytimeController,
     BudgetAccount,
+    BudgetSpec,
     BudgetTier,
     ControllerEvent,
     ControllerPolicy,
@@ -65,6 +67,7 @@ from oasis.tools import (
     create_tool_registry,
     invoke_tool,
 )
+from oasis.tools.registry import ToolRegistryError
 
 _PENDING_ARTIFACT_ID = "sha256-" + "0" * 64
 _PRIVACY_ORDER = {
@@ -135,6 +138,8 @@ class RunManager:
         tool_registry: ToolRegistry | None = None,
         problem_registry: ProblemRegistry | None = None,
         controller_policy: ControllerPolicy | None = None,
+        providers: Mapping[str, object] | None = None,
+        resources: Mapping[str, object] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.artifact_store = artifact_store
@@ -143,6 +148,8 @@ class RunManager:
         self.tool_registry = tool_registry or create_tool_registry(discover_entry_points=False)
         self.problem_registry = problem_registry or create_builtin_problem_registry()
         self.controller_policy = controller_policy or ControllerPolicy()
+        self.providers = dict(providers or {})
+        self.resources = dict(resources or {})
         self.max_concurrent_runs = max_concurrent_runs
         self.cancel_wait_seconds = cancel_wait_seconds
         self._monotonic = monotonic
@@ -155,6 +162,29 @@ class RunManager:
         return f"run-{uuid.uuid4().hex}"
 
     async def start(self, request: RunCreateRequest) -> RunCreatedResponse:
+        if "budget" not in request.model_fields_set:
+            settings = self.model_service.settings
+            request = request.model_copy(
+                update={
+                    "budget": BudgetSpec(
+                        wall_time_ms=settings.agent_wall_time_ms,
+                        max_total_model_tokens=settings.agent_total_tokens,
+                        max_generated_tokens=min(
+                            settings.agent_generated_tokens, settings.agent_total_tokens
+                        ),
+                        max_tool_calls=settings.agent_tool_calls,
+                    )
+                }
+            )
+        if "thinking_enabled" not in request.model_fields_set:
+            request = request.model_copy(
+                update={"thinking_enabled": self.model_service.settings.thinking}
+            )
+        for name in request.allowed_tools or ():
+            try:
+                self.tool_registry.get(name)
+            except ToolRegistryError as error:
+                raise RunManagerError(422, "unknown_tool", str(error)) from error
         run_id = request.run_id or self._new_run_id()
         async with self._lock:
             if run_id in self._active or self.run_store.read_metadata(run_id) is not None:
@@ -189,6 +219,41 @@ class RunManager:
                     await self.model_service.ensure_ready(backend)
                 finally:
                     active.started_at_monotonic = self._monotonic()
+            if active.request.message is not None:
+                active.phase = ManagedRunPhase.RUNNING
+                agent = MessageAgent(
+                    backend=backend,
+                    tools=self.tool_registry,
+                    problems=self.problem_registry,
+                    artifacts=self.artifact_store,
+                    runs=self.run_store,
+                    settings=self.model_service.settings,
+                    providers=self.providers,
+                    resources=self.resources,
+                    callback=self.publish,
+                    monotonic=self._monotonic,
+                )
+                result = await agent.run(
+                    run_id=run_id,
+                    message=active.request.message,
+                    budget=active.request.budget,
+                    cancellation=active.cancellation,
+                    seed=active.request.seed,
+                    thinking=active.request.thinking_enabled,
+                    allowed_tools=active.request.allowed_tools,
+                )
+                plan = self.model_service.runtime_plan_model(backend)
+                result = result.model_copy(
+                    update={
+                        "runtime_plan": plan,
+                        "compute_inventory": self.model_service.inventory_model(
+                            backend
+                        ).sanitized(),
+                        "hardware_validation": plan.hardware_validation.value,
+                    }
+                )
+                self.run_store.write_result(result)
+                return result
             problem_id, baseline_id, preparation_tool_calls = await self._resolve_source(
                 run_id, active
             )
@@ -201,7 +266,11 @@ class RunManager:
                 seed=active.request.seed,
                 enable_model=active.request.enable_model,
                 enable_deterministic_fallback=active.request.enable_deterministic_fallback,
-                allowed_tools=active.request.allowed_tools,
+                allowed_tools=(
+                    active.request.allowed_tools
+                    if active.request.allowed_tools is not None
+                    else ("improve",)
+                ),
                 thinking_enabled=active.request.thinking_enabled,
                 requested_tier=active.request.requested_tier,
                 runtime_plan=self.model_service.runtime_plan_model(backend),
@@ -235,6 +304,11 @@ class RunManager:
 
     @staticmethod
     def _uses_model(request: RunCreateRequest) -> bool:
+        if request.message is not None:
+            return (
+                request.budget.max_total_model_tokens > 0
+                and request.budget.max_generated_tokens > 0
+            )
         return (
             request.enable_model
             and request.budget.max_tool_calls > 0
@@ -438,6 +512,10 @@ class RunManager:
             terminal_reason=reason,
             budget_tier=BudgetTier.BASELINE_ONLY,
             problem_artifact_id=_PENDING_ARTIFACT_ID,
+            answer=(
+                "The model could not start. Please try again." if active.request.message else None
+            ),
+            answer_source="status" if active.request.message else None,
             requested_budget=active.request.budget,
             consumed_budget=budget.snapshot(),
             deadline_overshoot_ms=deadline.overshoot_ms,
@@ -500,6 +578,17 @@ class RunManager:
     async def is_active(self, run_id: str) -> bool:
         async with self._lock:
             return run_id in self._active
+
+    async def wait(self, run_id: str) -> RunResult:
+        """Await a run for the message-to-answer HTTP and CLI convenience interfaces."""
+        async with self._lock:
+            active = self._active.get(run_id)
+        if active is not None and active.task is not None:
+            return await asyncio.shield(active.task)
+        result = self.run_store.read_result(run_id)
+        if result is None:
+            raise RunManagerError(404, "run_not_found", "The requested run has no result.")
+        return result
 
     async def inspect(self, run_id: str) -> RunInspectionResponse:
         async with self._lock:
@@ -585,10 +674,15 @@ class RunManager:
                     "map_not_ready",
                     "The run has not committed a validated plan yet.",
                 )
-            problem_artifact_id = metadata.problem_artifact_id
+            event_problem_id = incumbent_event.payload.get("problem_artifact_id")
+            problem_artifact_id = (
+                event_problem_id
+                if isinstance(event_problem_id, str)
+                else metadata.problem_artifact_id
+            )
             plan_artifact_id = incumbent_event.artifact_ids[0]
             seed = metadata.seed
-        if plan_artifact_id is None:
+        if plan_artifact_id is None or problem_artifact_id is None:
             raise RunManagerError(422, "map_unavailable", "The run has no validated plan to map.")
         context = ToolContext(
             run_id=f"{run_id}-map",

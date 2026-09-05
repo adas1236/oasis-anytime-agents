@@ -25,7 +25,7 @@ class RunMetadata(BaseModel):
 
     run_id: str
     run_generation: int = Field(default=1, ge=1)
-    problem_artifact_id: str
+    problem_artifact_id: str | None = None
     seed: int
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 

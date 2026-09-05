@@ -99,6 +99,17 @@ class OasisSettings(BaseSettings):
     provider_backoff_base_seconds: float = Field(default=0.25, ge=0)
     provider_max_response_bytes: int = Field(default=10_000_000, ge=1)
     provider_max_pages: int = Field(default=20, ge=1)
+    place_endpoint: str = "https://nominatim.openstreetmap.org"
+    routing_endpoint: str = "https://router.project-osrm.org"
+    catalog_endpoint: str | None = None
+    agent_system_prompt: str | None = None
+    agent_wall_time_ms: int = Field(default=120_000, gt=0)
+    agent_total_tokens: int = Field(default=512_000, ge=0)
+    agent_generated_tokens: int = Field(default=32_768, ge=0)
+    agent_tool_calls: int = Field(default=64, ge=0)
+    agent_tool_rounds: int = Field(default=20, ge=1)
+    agent_generation_tokens: int = Field(default=2_048, ge=1)
+    agent_model_timeout_seconds: float = Field(default=60.0, gt=0)
     run_root: Path = Path(".oasis/runs")
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65_535)

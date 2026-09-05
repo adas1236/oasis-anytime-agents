@@ -172,7 +172,8 @@ async def test_openapi_discovery_chat_and_runtime_are_versioned_and_non_probing(
     assert any(tool["name"] == "improve" for tool in tools["tools"])
     assert any(problem["type_id"] == "mobile_service_route" for problem in problems["problems"])
     assert "/api/v1/runs/{run_id}/events" in schema["paths"]
-    assert schema["info"]["version"] == "1.1.0"
+    assert schema["info"]["version"] == "1.2.0"
+    assert "/api/v1/ask" in schema["paths"]
     assert "ApiErrorResponse" in schema["components"]["schemas"]
 
 
