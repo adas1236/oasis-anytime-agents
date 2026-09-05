@@ -277,6 +277,56 @@ PYTHONPATH=src .venv/bin/python -m oasis.registry_smoke \
   --output evaluation-output/registry-smoke
 ```
 
+### Hosted-model evaluation without an accelerator
+
+`--model-type api` runs the same registry evaluation against a hosted provider, so a machine with
+no GPU can still produce real-model results. Install the optional group first:
+
+```bash
+uv sync --group api
+```
+
+```bash
+uv run --no-sync python src/oasis/run_mock_experiment.py \
+  --gpus none \
+  --dataset all \
+  --model-type api --api-provider anthropic --model claude-sonnet-5 \
+  --shuffle --seed 42 --limit 50 \
+  --time-budgets 60s,300s,600s \
+  --token-budgets 64k,128k,unlimited \
+  --osrm-cache infra/runpod/osrm-cache --osrm-cache-only \
+  --output evaluation-output/api-grid/all.jsonl
+```
+
+`--api-provider anthropic` uses the official Anthropic SDK: native tool calling, adaptive thinking,
+prompt caching of the tool/system prefix, and exact input-token counting through the provider's
+counting endpoint. `--api-provider openai` targets any OpenAI-compatible `/chat/completions`
+deployment, including OpenRouter through `--api-base-url https://openrouter.ai/api/v1`; that
+protocol has no counting endpoint, so its pre-call input count is an estimate used only to size the
+per-turn generation allowance, while the budget ledger records the provider's reported usage.
+Credentials come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`; the Anthropic
+client also resolves an `ant auth login` profile, so an unset key is not by itself a missing
+credential. `--api-effort` sets `output_config.effort` for Anthropic models.
+
+Budget note: the 22-tool catalog plus the shared system prompt is roughly a 6,000-token prefix that
+is re-sent on every turn, and a completed case runs 7-12 turns. Measured aggregate consumption on
+`claude-sonnet-5` is about 95,000 tokens for a TSP record and 160,000-200,000 for a coverage record.
+The earlier provisional 32k token budget cannot complete any family; use it only to study truncation.
+
+Aggregate sharded runs with:
+
+```bash
+uv run --no-sync python -m oasis.api_grid_report evaluation-output/api-grid \
+  --output evaluation-output/report.json
+```
+
+Run the evaluation only through `src/oasis/run_mock_experiment.py`. Executing
+`python -m oasis.mock_experiments` loads a second copy of that module when
+`oasis.registry_experiments` imports it back, which creates two distinct `DatasetKind` enums; every
+`case.dataset is DatasetKind.X` check then silently returns `False`, baselines are built for the
+wrong family, and valid plans are rejected as solving "a different problem family". The module now
+refuses direct execution rather than reporting those plausible-looking but wrong scores.
+
 Run a real local model on selected GPUs by changing the model type and profile (or pass a custom
 Hugging Face ID with `--model`):
 

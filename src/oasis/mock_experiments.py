@@ -107,6 +107,10 @@ class ExperimentConfig:
     max_tool_calls: int | None = None
     resume: bool = False
     tool_mode: str = "registry"
+    api_provider: str = "anthropic"
+    api_base_url: str | None = None
+    api_effort: str | None = None
+    api_context_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1242,6 +1246,26 @@ def _fake_backend(case: MockCase) -> Any:
     )
 
 
+async def _api_backend(config: ExperimentConfig) -> Any:
+    """Hosted-model backend; no local weights, accelerator, or runtime plan involved."""
+
+    from oasis.llm.api_backend import create_api_backend
+
+    backend = create_api_backend(
+        provider=config.api_provider,
+        model_id=config.model,
+        base_url=config.api_base_url,
+        context_limit=config.api_context_limit,
+        effort=config.api_effort,
+        thinking=config.thinking,
+        timeout_seconds=(
+            None if config.case_timeout_seconds is None else config.case_timeout_seconds
+        ),
+    )
+    await backend.load()
+    return backend
+
+
 async def _transformers_backend(config: ExperimentConfig) -> Any:
     from oasis.config import (
         BackendKind,
@@ -1400,6 +1424,9 @@ def _config_payload(config: ExperimentConfig) -> dict[str, Any]:
         "dataset": config.dataset,
         "data_root": str(config.data_root),
         "model_type": config.model_type,
+        "api_provider": config.api_provider if config.model_type == "api" else None,
+        "api_base_url": config.api_base_url if config.model_type == "api" else None,
+        "api_effort": config.api_effort if config.model_type == "api" else None,
         "model": config.model,
         "profile": config.profile,
         "revision": config.revision,
@@ -1677,8 +1704,11 @@ async def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             await osrm.prepare_region(region)
 
     shared_backend = None
-    if config.model_type == "transformers" and pending_cells:
-        shared_backend = await _transformers_backend(config)
+    if pending_cells:
+        if config.model_type == "transformers":
+            shared_backend = await _transformers_backend(config)
+        elif config.model_type == "api":
+            shared_backend = await _api_backend(config)
 
     try:
         mode = "a" if config.resume else "w"
@@ -1842,9 +1872,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-type",
         "--backend",
         dest="model_type",
-        choices=["fake", "transformers"],
+        choices=["fake", "transformers", "api"],
         default="fake",
-        help="Use fake for a deterministic infrastructure smoke test.",
+        help=(
+            "fake is a deterministic infrastructure smoke test; transformers loads local "
+            "weights; api calls a hosted provider and needs no accelerator."
+        ),
+    )
+    parser.add_argument(
+        "--api-provider",
+        choices=["anthropic", "openai"],
+        default="anthropic",
+        help="Hosted provider for --model-type api; openai also covers OpenRouter.",
+    )
+    parser.add_argument(
+        "--api-base-url",
+        help="Override the hosted provider endpoint, e.g. https://openrouter.ai/api/v1.",
+    )
+    parser.add_argument(
+        "--api-effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Anthropic output_config effort; omitted means the provider default.",
+    )
+    parser.add_argument(
+        "--api-context-limit",
+        type=int,
+        help="Optional context window used to bound each turn's generation allowance.",
     )
     parser.add_argument("--model", help="Hugging Face model ID for transformers runs.")
     parser.add_argument("--profile", default="gemma4_e2b_it")
@@ -2005,6 +2058,10 @@ def _validated_config(
         dataset=namespace.dataset,
         data_root=namespace.data_root,
         model_type=namespace.model_type,
+        api_provider=namespace.api_provider,
+        api_base_url=namespace.api_base_url,
+        api_effort=namespace.api_effort,
+        api_context_limit=namespace.api_context_limit,
         model=namespace.model,
         profile=namespace.profile,
         revision=namespace.revision,
@@ -2050,5 +2107,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__":  # pragma: no cover - guarded entry point
+    # Running this file as a script (python -m oasis.mock_experiments, or by path)
+    # imports it a second time as `oasis.mock_experiments` when registry_experiments
+    # imports it back. The two copies define two distinct DatasetKind enums, so every
+    # `case.dataset is DatasetKind.X` identity check silently returns False: baselines
+    # are built for the wrong family and valid plans are rejected as "a different
+    # problem family". The failure produces plausible-looking scores, so refuse it.
+    raise SystemExit(
+        "Run the evaluation through src/oasis/run_mock_experiment.py, not by executing "
+        "this module directly; a direct run loads a second copy of this module and "
+        "silently mis-scores every record."
+    )
