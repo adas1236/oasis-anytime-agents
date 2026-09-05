@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Budget-aware GeoAI agents for public-health spatial equity"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-authors = [{ name = "OASIS contributors" }]
+authors = [
+  { name = "Nicole Schneider" },
+  { name = "Manya Garg" },
+  { name = "Rudrank Singh" },
+  { name = "Avik Das" },
+  { name = "Kent O'Sullivan" },
+]
 dependencies = [
   "fastapi>=0.116,<1",
   "geopandas>=1.1,<2",
