@@ -1,7 +1,8 @@
-# Ignore local planning notes while tracking only the root README.
-*.md
-!/README.md
-!/infra/runpod/README.md
+# Ignore local planning notes without hiding project documentation. A blanket
+# *.md rule also swallows LICENSE.md, CONTRIBUTING.md, and any docs/ tree, so
+# keep untracked markdown under notes/ or name it *.local.md instead.
+notes/
+*.local.md
 HARDWARE_CHANGES.md
 
 # Python bytecode and environments

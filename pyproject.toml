@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Budget-aware GeoAI agents for public-health spatial equity"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-authors = [{ name = "OASIS contributors" }]
+authors = [
+  { name = "Nicole Schneider" },
+  { name = "Manya Garg" },
+  { name = "Rudrank Singh" },
+  { name = "Avik Das" },
+  { name = "Kent O'Sullivan" },
+]
 dependencies = [
   "fastapi>=0.116,<1",
   "geopandas>=1.1,<2",
@@ -55,6 +61,11 @@ gpu = [
 ]
 runpod = [
   "boto3>=1.40,<2",
+]
+# Hosted-model evaluation. Optional so the default CPU environment is unchanged
+# and so a machine without an accelerator can still run real-model experiments.
+api = [
+  "anthropic>=1,<2",
 ]
 dev = [
   "hypothesis>=6.138,<7",
